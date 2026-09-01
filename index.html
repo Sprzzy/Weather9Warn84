@@ -1,6 +1,69 @@
 <!DOCTYPE html>
 
-<html lang="en" style="--ui-scale: 1.2; --rsChromeBottom: 174px;"><head><meta content="text/html; charset=utf-8" http-equiv="Content-Type"/>
+<html lang="en" style="--ui-scale: 1.2; --rsChromeBottom: 174px;"><head>
+<script id="ww9PerformanceSchedulerV0123">
+(function(){
+  'use strict';
+  if(window.WW9PerfScheduler)return;
+  const tasks=new Map();
+  let timer=0,serial=0,lastRun=performance.now();
+  const stats={ticks:0,runs:0,skippedHidden:0,skippedCondition:0,longRuns:0};
+  function now(){return performance.now()}
+  function arm(){
+    if(timer){clearTimeout(timer);timer=0}
+    if(!tasks.size)return;
+    const t=now();let due=Infinity;
+    tasks.forEach(task=>{if(task.next<due)due=task.next});
+    timer=setTimeout(tick,Math.max(16,Math.min(60000,due-t)));
+  }
+  function finishAsync(task,p){
+    task.running=true;
+    Promise.resolve(p).catch(e=>{try{console.warn('WW9 scheduled task failed:',task.name,e)}catch(_e){}}).finally(()=>{task.running=false});
+  }
+  function tick(){
+    timer=0;stats.ticks++;lastRun=now();const t=lastRun;
+    tasks.forEach(task=>{
+      if(t+1<task.next)return;
+      // Advance from "now" instead of replaying missed intervals after sleep/backgrounding.
+      task.next=t+task.interval;
+      if(task.visibleOnly&&document.hidden){stats.skippedHidden++;return}
+      if(task.when){let ok=false;try{ok=!!task.when()}catch(_e){}if(!ok){stats.skippedCondition++;return}}
+      if(task.running&&task.noOverlap!==false)return;
+      const started=now();
+      try{
+        const result=task.fn();stats.runs++;
+        if(result&&typeof result.then==='function')finishAsync(task,result);
+      }catch(e){try{console.warn('WW9 scheduled task failed:',task.name,e)}catch(_e){}}
+      if(now()-started>20)stats.longRuns++;
+    });
+    arm();
+  }
+  function every(name,interval,fn,opts){
+    opts=opts||{};interval=Math.max(opts.fast?50:250,Number(interval)||1000);
+    const key=String(name||('task-'+(++serial)));
+    tasks.set(key,{name:key,interval,fn,visibleOnly:opts.visibleOnly!==false,when:typeof opts.when==='function'?opts.when:null,noOverlap:opts.noOverlap!==false,running:false,next:now()+(opts.immediate?0:interval)});
+    arm();return key;
+  }
+  function cancel(name){const ok=tasks.delete(String(name));arm();return ok}
+  function run(name){const task=tasks.get(String(name));if(!task)return false;task.next=0;arm();return true}
+  function retry(name,interval,maxTries,fn){
+    let tries=0,key='';
+    key=every('boot:'+String(name),interval,function(){
+      tries++;
+      let result=false;try{result=fn(tries)}catch(e){try{console.warn('WW9 boot retry failed:',name,e)}catch(_e){}}
+      if(result&&typeof result.then==='function')return result.then(ok=>{if(ok||tries>=maxTries)cancel(key);return ok});
+      if(result||tries>=maxTries)cancel(key);
+      return result;
+    },{visibleOnly:false,noOverlap:true,fast:true,immediate:true});
+    return key;
+  }
+  function snapshot(){return{taskCount:tasks.size,tasks:Array.from(tasks.values()).map(t=>({name:t.name,interval:t.interval,running:t.running,nextInMs:Math.max(0,Math.round(t.next-now()))})),stats:Object.assign({},stats),lastRun:lastRun}}
+  document.addEventListener('visibilitychange',()=>{if(!document.hidden){const t=now();tasks.forEach(task=>{if(task.next<t)task.next=t+50});arm()}},{passive:true});
+  window.addEventListener('pageshow',arm,{passive:true});
+  window.WW9PerfScheduler={every,cancel,run,retry,snapshot};
+})();
+</script>
+<meta content="text/html; charset=utf-8" http-equiv="Content-Type"/>
 <meta content="width=device-width, initial-scale=1" name="viewport"/>
 <title>WW9 0.1.22</title>
 <meta name="ww9-version" content="0.1.22"/>
@@ -248,16 +311,17 @@ html.ww9-initial-loading {
   // Phase 17: don't make the workstation splash depend on every optional
   // image/model endpoint finishing its browser load event. As soon as the map
   // engine exists and has had a moment to attach the UI, reveal the app.
-  var readyPoll=setInterval(function(){
+  var readyPoll=window.WW9PerfScheduler.retry('initial-map-ready',120,100,function(){
     try{
       var m=window.WW9Map||window.map;
       var native=m&&m._maplibre;
       var ready=!!(m&&(m._ready||(native&&typeof native.loaded==='function'&&native.loaded())));
-      if(ready){clearInterval(readyPoll);setTimeout(finish,260);}
-    }catch(e){}
-  },120);
+      if(ready)setTimeout(finish,260);
+      return ready;
+    }catch(e){return false}
+  });
   // Never strand the user behind the splash if an optional network asset fails.
-  setTimeout(function(){try{clearInterval(readyPoll)}catch(e){}finish();},12000);
+  setTimeout(function(){try{window.WW9PerfScheduler.cancel(readyPoll)}catch(e){}finish();},12000);
 
   window.WW9InitialLoadingScreen={
     finish:finish,
@@ -280,6 +344,10 @@ html.ww9-initial-loading {
   if(!global.maplibregl) throw new Error('MapLibre GL JS is required before WW9GL.');
 
   const ML = global.maplibregl;
+  // Phase 39: cap worker fan-out. Extra workers duplicate tile/parser memory and
+  // are a bad trade on Chromebooks; two workers is enough for the normal map.
+  try{if(typeof ML.setWorkerCount==='function')ML.setWorkerCount(global.WW9_LOW_POWER?2:Math.min(4,Math.max(2,Number(navigator.hardwareConcurrency)||2)))}catch(_e){}
+  try{if(typeof ML.setMaxParallelImageRequests==='function')ML.setMaxParallelImageRequests(global.WW9_LOW_POWER?4:8)}catch(_e){}
   let uid = 0;
   const nextId = (p='ww9gl') => `${p}-${++uid}`;
   const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
@@ -465,7 +533,7 @@ html.ww9-initial-loading {
         container:el,
         style:{version:8,glyphs:'https://tiles.openfreemap.org/fonts/{fontstack}/{range}.pbf',sources:{},layers:[{id:'ww9gl-background',type:'background',paint:{'background-color':'#071018'}}]},
         center:[-96,39],zoom:toMLZoom(5),minZoom:toMLZoom(0),maxZoom:mlCameraZoom(maxZoom),
-        renderWorldCopies:this.options.worldCopyJump!==false,
+        renderWorldCopies:global.WW9_LOW_POWER?false:(this.options.worldCopyJump!==false),
         attributionControl:false,
         dragRotate:true,
         pitchWithRotate:true,
@@ -474,16 +542,20 @@ html.ww9-initial-loading {
         bearingSnap:0,
         minPitch:0,
         maxPitch:85,
-        anisotropicFilterPitch:15,
-        // Keep enough source levels resident for steep-angle views. The default
-        // cache/overscale policy can become visibly aggressive above 60 degrees.
-        maxTileCacheZoomLevels:8,
+        anisotropicFilterPitch:global.WW9_LOW_POWER?1:4,
+        // Phase 39 performance sweep: keeping eight complete zoom levels resident
+        // multiplied raster/vector memory use at high pitch. Two levels is enough
+        // for Chromebook mode; four keeps normal-mode pitch transitions smooth.
+        maxTileCacheZoomLevels:global.WW9_LOW_POWER?2:4,
+        maxTileCacheSize:global.WW9_LOW_POWER?96:256,
+        refreshExpiredTiles:false,
         fadeDuration:0,
-        crossSourceCollisions:true,
-        canvasContextAttributes:{antialias:true,preserveDrawingBuffer:true}
+        crossSourceCollisions:global.WW9_LOW_POWER?false:true,
+        pixelRatio:global.WW9_LOW_POWER?1:Math.min(1.5,global.devicePixelRatio||1),
+        canvasContextAttributes:{antialias:!global.WW9_LOW_POWER,preserveDrawingBuffer:true,powerPreference:global.WW9_LOW_POWER?'low-power':'high-performance'}
       });
-      try{this._gl.cancelPendingTileRequestsWhileZooming=false;}catch(_e){}
-      try{this._gl.setAnisotropicFilterPitch&&this._gl.setAnisotropicFilterPitch(15);}catch(_e){}
+      try{this._gl.cancelPendingTileRequestsWhileZooming=!!global.WW9_LOW_POWER;}catch(_e){}
+      try{this._gl.setAnisotropicFilterPitch&&this._gl.setAnisotropicFilterPitch(global.WW9_LOW_POWER?1:4);}catch(_e){}
       this._container=el; this._mapPane=this.createPane('mapPane');
       this.dragging=new InteractionHandler(this._gl.dragPan);
       this.scrollWheelZoom=new InteractionHandler(this._gl.scrollZoom);
@@ -555,8 +627,11 @@ html.ww9-initial-loading {
         const p=String(pane||'');
         // Roads/radar are visually important at steep pitch: allow more LODs
         // and more tiles before MapLibre degrades toward the horizon.
-        const critical=/roadsPane|radarPane/i.test(p);
-        this._gl.setSourceTileLodParams(critical?7:5,critical?6:4,String(sourceId));
+        const critical=/roadsPane|radarPane/i.test(p),low=!!global.WW9_LOW_POWER;
+        // Phase 39: the old 7/6 critical-source budget could retain hundreds of
+        // additional raster tiles at pitch. Keep only the LODs that are actually
+        // useful on screen.
+        this._gl.setSourceTileLodParams(low?(critical?3:2):(critical?5:4),low?(critical?2:1):(critical?4:3),String(sourceId));
       }catch(_e){}
       return this;
     }
@@ -5956,9 +6031,9 @@ window.WW9_MAJOR_LAKES = [{"name":"Great Lakes \u2014 Superior / Michigan / Huro
     const gl=getMap();if(!gl||!gl.isStyleLoaded||!gl.isStyleLoaded())return;
     window.WW9LoadWorldCountriesGeoJSON(false).then(geo=>{
       const g=getMap();if(!g||!g.isStyleLoaded||!g.isStyleLoaded())return;
-      // Replace any Phase-2 country line that borrowed the land-mask source.
-      try{if(g.getLayer('ww9-native-country-boundaries'))g.removeLayer('ww9-native-country-boundaries')}catch(_e){}
-      try{if(g.getSource('ww9-native-countries-direct')){const src=g.getSource('ww9-native-countries-direct');src&&src.setData&&src.setData(geo)}else g.addSource('ww9-native-countries-direct',{type:'geojson',data:geo,maxzoom:24,buffer:128,tolerance:.08})}catch(e){console.warn('WW9 country source install failed',e);return;}
+      // Phase 39: install once. The former 1.5-second watchdog removed and
+      // recreated this layer forever, continuously dirtying the MapLibre style.
+      try{if(!g.getSource('ww9-native-countries-direct'))g.addSource('ww9-native-countries-direct',{type:'geojson',data:geo,maxzoom:24,buffer:128,tolerance:.08})}catch(e){console.warn('WW9 country source install failed',e);return;}
       addLineSafe(g,'ww9-native-country-boundaries','ww9-native-countries-direct',{
         'line-color':'rgba(255,255,255,0.98)',
         'line-width':['interpolate',['linear'],['zoom'],0,0.55,3,0.75,6,1.0,10,1.35,16,1.75,23.9,2.15],
@@ -5980,7 +6055,7 @@ window.WW9_MAJOR_LAKES = [{"name":"Great Lakes \u2014 Superior / Michigan / Huro
       }
       installed=true;
     }
-    installCountries();
+    if(!gl.getLayer('ww9-native-country-boundaries'))installCountries();
     if(!stateLoadStarted){
       stateLoadStarted=true;
       fetch(STATE_URL,{cache:'force-cache',mode:'cors',credentials:'omit'}).then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}).then(geo=>{
@@ -5998,7 +6073,7 @@ window.WW9_MAJOR_LAKES = [{"name":"Great Lakes \u2014 Superior / Michigan / Huro
   function boot(){if(!install())setTimeout(boot,120);}
   window.addEventListener('load',boot,{once:true});
   if(document.readyState==='complete')setTimeout(boot,0);
-  setInterval(()=>{try{install();sync();}catch(e){}},1500);
+  // No permanent install watchdog: sources/layers are persistent in MapLibre.
   ['countryNamesToggle','countiesToggle'].forEach(id=>{const el=document.getElementById(id);if(el)el.addEventListener('change',()=>setTimeout(sync,0));});
   window.WW9NativeBoundaries={sync:sync,install:install,reloadCountries:()=>window.WW9LoadWorldCountriesGeoJSON(true).then(()=>installCountries())};
 })();
@@ -8908,8 +8983,8 @@ const max2 = (rr>gg ? (rr>bb ? rr : bb) : (gg>bb ? gg : bb));
         try{gl.dragRotate&&gl.dragRotate.enable();}catch(_e){}
         try{gl.touchPitch&&gl.touchPitch.enable();}catch(_e){}
         try{gl.touchZoomRotate&&gl.touchZoomRotate.enable();}catch(_e){}
-        try{gl.cancelPendingTileRequestsWhileZooming=false;}catch(_e){}
-        try{gl.setAnisotropicFilterPitch&&gl.setAnisotropicFilterPitch(15);}catch(_e){}
+        try{gl.cancelPendingTileRequestsWhileZooming=!!window.WW9_LOW_POWER;}catch(_e){}
+        try{gl.setAnisotropicFilterPitch&&gl.setAnisotropicFilterPitch(window.WW9_LOW_POWER?1:4);}catch(_e){}
       };
       gl.on('styledata',enforce);gl.on('load',enforce);enforce();
       window.WW9MapLibrePhase4=Object.assign(window.WW9MapLibrePhase3||window.WW9MapLibrePhase2||{}, {
@@ -12976,7 +13051,7 @@ if (window.ResizeObserver) {
   function updateAllTimeLeftLabels() {
     warnings.forEach(updateTimeLeftLabel);
   }
-  setInterval(updateAllTimeLeftLabels, window.WW9_LOW_POWER ? 2500 : 1000);
+  window.WW9PerfScheduler.every('warning-time-left',window.WW9_LOW_POWER?10000:5000,updateAllTimeLeftLabels,{visibleOnly:true});
 
   let drawing = false;
   let drawVertices = [];
@@ -15789,7 +15864,7 @@ function addTrackerLine(latlngs, label) {
       archiveClock.textContent = now.toLocaleTimeString() + " " + now.toLocaleDateString();
     }
   }
-  setInterval(updateArchiveClockText, window.WW9_LOW_POWER ? 2000 : 1000);
+  window.WW9PerfScheduler.every('archive-clock',window.WW9_LOW_POWER?6000:3000,updateArchiveClockText,{visibleOnly:true});
   updateArchiveClockText();
 
   if (archiveSpeed && archiveSpeedValue) {
@@ -23227,7 +23302,7 @@ map.on("popupclose", e => {
   },true);
   document.addEventListener("visibilitychange", () => { if (document.hidden) autosaveProjectNow(true); });
   window.addEventListener("pagehide", () => autosaveProjectNow(true));
-  setInterval(() => autosaveProjectNow(true), 15000);
+  window.WW9PerfScheduler.every('autosave-safety',60000,()=>autosaveProjectNow(false),{visibleOnly:true,noOverlap:true});
   window.addEventListener("beforeunload", () => autosaveProjectNow(true));
   if(location.protocol==='file:')console.warn('WW9 0.1.22: browser autosave works for this file URL, but storage portability across renamed/updated HTML files is browser-dependent. Use Start_WW9_0.1.22.bat only if you want a stable localhost origin across builds.');
   window.WW9Autosave={
@@ -23543,14 +23618,11 @@ function tzlookup(Y,W){"use strict";var U="XIXHXHXGXGXQXQXPXPXOXOXN##U6U6UW#$U%U
   if (productSel) productSel.addEventListener("change", update);
 
   let lastSite = "", lastProd = "";
-  setInterval(() => {
+  window.WW9PerfScheduler.every('radar-selector-summary',window.WW9_LOW_POWER?30000:15000,()=>{
     const s = siteSel ? siteSel.value : "";
     const p = productSel ? productSel.value : "";
-    if (s !== lastSite || p !== lastProd){
-      lastSite = s; lastProd = p;
-      update();
-    }
-  }, window.WW9_LOW_POWER ? 1500 : 500);
+    if (s !== lastSite || p !== lastProd){lastSite=s;lastProd=p;update();}
+  },{visibleOnly:true});
 
   update();
 })();
@@ -26764,7 +26836,7 @@ body.warning-focus #radarAppearancePanel{
   install();
   if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', install, {once:true});
   window.addEventListener('load', function(){ install(); setTimeout(install,250); setTimeout(install,1000); setTimeout(install,2500); });
-  setInterval(function(){ if(!document.hidden&&sandboxOn()) visibleSandboxControls(); }, window.WW9_LOW_POWER ? 2400 : 800);
+  window.WW9PerfScheduler.every('sandbox-controls-repair',window.WW9_LOW_POWER?30000:15000,visibleSandboxControls,{visibleOnly:true,when:sandboxOn});
   window.WW9SandboxMulticellFix = { install: install, syncSandboxToNative: syncSandboxToNativeHard, version: '1.7.39.8' };
 })();
 </script>
@@ -27063,7 +27135,7 @@ body.warning-focus #radarAppearancePanel{
   install();
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', install, { once:true });
   window.addEventListener('load', function(){ install(); setTimeout(install, 250); setTimeout(install, 1000); });
-  setInterval(function(){ if(!document.hidden&&sandboxOn()) { applySandboxChrome(); recolorActiveDraft(); } }, window.WW9_LOW_POWER ? 1200 : 300);
+  window.WW9PerfScheduler.every('sandbox-style-repair',window.WW9_LOW_POWER?30000:15000,function(){applySandboxChrome();recolorActiveDraft();},{visibleOnly:true,when:sandboxOn});
 
   window.WW9SandboxMenuColorFix = { version: VERSION, install: install, recolorActiveDraft: recolorActiveDraft };
 })();
@@ -28757,9 +28829,9 @@ textarea::-webkit-scrollbar-thumb:hover{
     return true;
   }
   function scheduleAutoRefresh(){
-    if(refreshTimer){ clearInterval(refreshTimer); refreshTimer = null; }
-    var auto = byId('ww9MetarAutoRefresh');
-    if(auto && auto.checked) refreshTimer = setInterval(function(){ if(enabled()) refresh(); }, OBS_TTL_MS);
+    if(refreshTimer){ try{window.WW9PerfScheduler.cancel(refreshTimer)}catch(e){} refreshTimer=null; }
+    var auto=byId('ww9MetarAutoRefresh');
+    if(auto&&auto.checked)refreshTimer=window.WW9PerfScheduler.every('metar-auto-refresh',OBS_TTL_MS,refresh,{visibleOnly:true,when:enabled,noOverlap:true});
   }
   function installMapHooks(){
     var map = getMap();
@@ -28774,12 +28846,7 @@ textarea::-webkit-scrollbar-thumb:hover{
   function boot(){ installControls(); installMapHooks(); ensureLayer(); }
   if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
   else boot();
-  var tries = 0;
-  var bootTimer = setInterval(function(){
-    tries++;
-    boot();
-    if((byId('ww9MetarBox') && getMap()) || tries > 40) clearInterval(bootTimer);
-  }, 500);
+  window.WW9PerfScheduler.retry('metar-ui',500,41,function(){boot();return !!(byId('ww9MetarBox')&&getMap())});
   window.WW9MetarCycleGraph = function(key, dir){
     key = String(key || '');
     graphState.set(key, (graphState.get(key) || 0) + (Number(dir) || 0));
@@ -29523,18 +29590,13 @@ textarea::-webkit-scrollbar-thumb:hover{
       site.__ww9StormTracksHookV1919 = true;
       site.addEventListener('change', function(){ if(enabled()) { updateVisible(); refresh(false); } });
     }
-    setInterval(function(){ if(enabled()) refresh(false); }, 2 * 60000);
+    window.WW9PerfScheduler.every('storm-tracks-refresh',2*60000,function(){refresh(false)},{visibleOnly:true,when:enabled});
     return true;
   }
   function boot(){ installControls(); installMapHooks(); ensureLayer(); }
   if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
   else boot();
-  var tries = 0;
-  var bootTimer = setInterval(function(){
-    tries++;
-    boot();
-    if((byId('ww9StormTracksBox') && getMap()) || tries > 40) clearInterval(bootTimer);
-  }, 500);
+  window.WW9PerfScheduler.retry('storm-tracks-ui',500,41,function(){boot();return !!(byId('ww9StormTracksBox')&&getMap())});
   window.WW9RefreshStormTracks = function(){ refresh(true); };
 })();
 </script>
@@ -37367,8 +37429,8 @@ body.ww9-special-hazard-mode .ww9SpecialLegacy{display:none!important}
   function normalizeId(v){const s=String(v||"").trim().toLowerCase();return /^(al|ep|cp|wp|io|sh)\d{2}\d{4}$/.test(s)?s:""}
   function basinLabel(id){return ({al:"North Atlantic",ep:"Eastern Pacific",cp:"Central Pacific",wp:"Western Pacific",io:"North Indian",sh:"Southern Hemisphere"})[String(id||"").slice(0,2)]||"Tropical"}
   function isNhcBasin(id){return /^(al|ep|cp)/.test(String(id||""))}
-  function category(w){const n=Number(w)||0;for(const x of INTENSITY)if(n>=x[0])return{color:x[1],short:x[2],name:x[2]==="TS"?"Tropical Storm":x[2]==="TD"?"Tropical Depression":"Category "+x[2].slice(1)};return{color:"#6c8bd9",short:"TD",name:"Tropical Depression"}}
-  function windText(w){const n=Number(w);if(!Number.isFinite(n))return"--";return el.units&&el.units.value==="mph"?Math.round(n*1.15078)+" mph":Math.round(n)+" kt"}
+  function category(w){const n=tcWindNum(w)??0;for(const x of INTENSITY)if(n>=x[0])return{color:x[1],short:x[2],name:x[2]==="TS"?"Tropical Storm":x[2]==="TD"?"Tropical Depression":"Category "+x[2].slice(1)};return{color:"#6c8bd9",short:"TD",name:"Tropical Depression"}}
+  function windText(w){const n=tcWindNum(w);if(n===null)return"--";return el.units&&el.units.value==="mph"?Math.round(n*1.15078)+" mph":Math.round(n)+" kt"}
   function cycleLabel(c){c=String(c||"");return /^\d{10}$/.test(c)?c.slice(0,4)+"-"+c.slice(4,6)+"-"+c.slice(6,8)+" "+c.slice(8,10)+"Z":c}
   function setStatus(msg,kind){if(!el.status)return;el.status.textContent=msg;el.status.className="ww9-t2-status"+(kind?" "+kind:"")}
   function guideStatus(msg,kind){if(!el.guidanceStatus)return;el.guidanceStatus.textContent=msg;el.guidanceStatus.className="ww9-t2-status"+(kind?" "+kind:"")}
@@ -37416,7 +37478,8 @@ body.ww9-special-hazard-mode .ww9SpecialLegacy{display:none!important}
     const a=f&&f.attributes||{},g=f&&f.geometry||{};let id=normalizeId(a.STORMID);
     const basin=esriBasinCode(a.BASIN),num=Number(a.STORMNUM)||0,year=Number(a.YEAR)||((new Date(Number(a.DTG)||Date.now())).getUTCFullYear());
     if(!id&&basin&&num&&year)id=normalizeId(basin+String(num).padStart(2,"0")+year);if(!id)return null;
-    return{long_atcf_id:id,atcf_id:id.slice(0,4),storm_name:String(a.STORMNAME||"TROPICAL SYSTEM"),winds:Number(a.INTENSITY||a.MAXWIND)||0,pressure:Number(a.MSLP)||0,latitude:safeNum(a.LAT)!=null?safeNum(a.LAT):safeNum(g.y),longitude:safeNum(a.LON)!=null?safeNum(a.LON):safeNum(g.x),analysis_time:dateFromEsri(a.DTG),cyclone_nature:String(a.STORMTYPE||""),advisory_number:String(a.ADVISNUM||""),bin_number:"",provider:String(a.STORMSRC||((id.slice(0,2)==="wp"||id.slice(0,2)==="io"||id.slice(0,2)==="sh")?"JTWC / Esri":"NHC / Esri")),esri_live:true,esri_storm_id:String(a.STORMID||""),esri_basin:String(a.BASIN||""),storm_num:num};
+    const alat=tcLatNum(a.LAT),alon=tcLonNum(a.LON);
+    return{long_atcf_id:id,atcf_id:id.slice(0,4),storm_name:String(a.STORMNAME||"TROPICAL SYSTEM"),winds:tcWindNum(a.INTENSITY!=null?a.INTENSITY:a.MAXWIND)??0,pressure:tcPressureNum(a.MSLP)??0,latitude:alat!==null?alat:tcLatNum(g.y),longitude:alon!==null?alon:tcLonNum(g.x),analysis_time:dateFromEsri(a.DTG),cyclone_nature:String(a.STORMTYPE||""),advisory_number:String(a.ADVISNUM||""),bin_number:"",provider:String(a.STORMSRC||((id.slice(0,2)==="wp"||id.slice(0,2)==="io"||id.slice(0,2)==="sh")?"JTWC / Esri":"NHC / Esri")),esri_live:true,esri_storm_id:String(a.STORMID||""),esri_basin:String(a.BASIN||""),storm_num:num};
   }
   async function fetchEsriActiveSystems(){
     const data=await esriQuery(1,{where:"1=1",outFields:"STORMNAME,DTG,YEAR,MSLP,BASIN,STORMNUM,STORMTYPE,INTENSITY,LAT,LON,STORMID",returnGeometry:"true"},3600);
@@ -37467,7 +37530,45 @@ body.ww9-special-hazard-mode .ww9SpecialLegacy{display:none!important}
   }
   function prop(obj,name){const p=obj&&obj.properties||{};if(Object.prototype.hasOwnProperty.call(p,name))return p[name];const key=Object.keys(p).find(k=>k.toLowerCase()===String(name).toLowerCase());return key?p[key]:undefined}
   function safeNum(v){const n=Number(v);return Number.isFinite(n)?n:null}
+  // ATCF/NHC/JTWC/ArcGIS feeds commonly use large numeric sentinels (especially
+  // 999/9999/-9999) for unavailable fields. Keep generic safeNum() permissive,
+  // but never let those placeholders become real tropical meteorology.
+  function tcWindNum(v){const n=safeNum(v);return n!==null&&n>=0&&n<=250?n:null}
+  function tcPressureNum(v){const n=safeNum(v);return n!==null&&n>=800&&n<=1100?n:null}
+  function tcLatNum(v){const n=safeNum(v);return n!==null&&n>=-90&&n<=90?n:null}
+  function tcLonNum(v){const n=safeNum(v);return n!==null&&n>=-180&&n<=180?n:null}
+  function tcMotionDirNum(v){const n=safeNum(v);if(n===null||n<0||n>360)return null;return n===360?0:n}
+  function tcMotionSpeedNum(v){const n=safeNum(v);return n!==null&&n>=0&&n<=150?n:null}
+  function tcPressureText(v){const n=tcPressureNum(v);return n===null?"--":Math.round(n)+" mb"}
+  function tcMotionText(dirValue,speedValue){
+    const dir=tcMotionDirNum(dirValue),spd=tcMotionSpeedNum(speedValue);if(dir===null||spd===null)return "";
+    if(spd===0)return "Stationary";
+    const names=["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"],card=names[Math.round(dir/22.5)%16];
+    return card+" · "+String(Math.round(dir)).padStart(3,"0")+"° at "+Math.round(spd)+" kt";
+  }
+  function tcStormMotionText(storm){return tcMotionText(storm&&storm.movement_dir,storm&&storm.movement_speed)}
+  function applyTropicalCurrent(target,current,source){
+    if(!target||!current)return false;let changed=false;
+    const pressure=tcPressureNum(current.pressure!=null?current.pressure:current.mslp),wind=tcWindNum(current.winds!=null?current.winds:current.wind),dir=tcMotionDirNum(current.movement_dir!=null?current.movement_dir:current.tcdir),spd=tcMotionSpeedNum(current.movement_speed!=null?current.movement_speed:current.tcspd);
+    if(pressure!==null&&tcPressureNum(target.pressure)!==pressure){target.pressure=pressure;changed=true}
+    if(wind!==null&&tcWindNum(target.winds)!==wind){target.winds=wind;changed=true}
+    if(dir!==null&&spd!==null&&(tcMotionDirNum(target.movement_dir)!==dir||tcMotionSpeedNum(target.movement_speed)!==spd)){target.movement_dir=dir;target.movement_speed=spd;changed=true}
+    const lat=tcLatNum(current.latitude!=null?current.latitude:current.lat),lon=tcLonNum(current.longitude!=null?current.longitude:current.lon);
+    if(lat!==null&&tcLatNum(target.latitude)===null){target.latitude=lat;changed=true}
+    if(lon!==null&&tcLonNum(target.longitude)===null){target.longitude=lon;changed=true}
+    if(source&&changed)target.current_advisory_source=String(source);
+    return changed;
+  }
+  function mergeCurrentAdvisoryIntoStorm(storm,current,source){
+    const id=normalizeId(storm&&storm.long_atcf_id);if(!id||!current)return false;let changed=false;
+    changed=applyTropicalCurrent(storm,current,source)||changed;
+    for(const x of state.storms||[])if(normalizeId(x&&x.long_atcf_id)===id)changed=applyTropicalCurrent(x,current,source)||changed;
+    if(state.stormId===id&&state.storm)changed=applyTropicalCurrent(state.storm,current,source)||changed;
+    if(changed){try{renderStormList()}catch(_e){}try{renderCenters()}catch(_e){}try{updateSummary()}catch(_e){}}
+    return changed;
+  }
   function stormNumber(id){return Number(String(id||"").slice(2,4))||0}
+  window.WW9TropicalSentinelFix={pressure:[800,1100],wind:[0,250],motionDirection:[0,360],motionSpeed:[0,150],coordinateValidation:true,advisoryMotionPressureFix:true};
   function basinMatches(value,id){
     const b=String(value||"").toLowerCase().replace(/[^a-z]/g,""),p=String(id||"").slice(0,2);if(!b)return true;
     if(p==="al")return b==="al"||b.includes("atlantic");
@@ -37500,10 +37601,11 @@ body.ww9-special-hazard-mode .ww9SpecialLegacy{display:none!important}
     if(!state.centerGroup)return;
     state.centerGroup.clearLayers();
     for(const s of state.storms){
-      const lat=safeNum(s.latitude),lng=safeNum(s.longitude);if(lat===null||lng===null)continue;
+      const lat=tcLatNum(s.latitude),lng=tcLonNum(s.longitude);if(lat===null||lng===null)continue;
       const id=normalizeId(s.long_atcf_id),selected=id===state.stormId;
       const m=L.marker([lat,lng],{pane:"tropicalV2MarkerPane",icon:stormMarkerIcon(s,selected),keyboard:false,zIndexOffset:selected?600:100});
-      m.bindTooltip('<b>'+esc(s.storm_name||"TROPICAL SYSTEM")+'</b><br>'+esc(String(s.long_atcf_id||"").toUpperCase())+' · '+esc(windText(s.winds))+'<br>'+esc((s.pressure||"--")+' mb')+' · '+esc(String(s.analysis_time||"").replace(".000Z","Z")),{className:"ww9-t2-tooltip",direction:"top"});
+      const motion=tcStormMotionText(s);
+      m.bindTooltip('<b>'+esc(s.storm_name||"TROPICAL SYSTEM")+'</b><br>'+esc(String(s.long_atcf_id||"").toUpperCase())+' · '+esc(windText(s.winds))+'<br>'+esc(tcPressureText(s.pressure))+' · '+esc(String(s.analysis_time||"").replace(".000Z","Z"))+(motion?'<br>Motion '+esc(motion):''),{className:"ww9-t2-tooltip",direction:"top"});
       m.on("click",()=>selectStorm(id,true));m.addTo(state.centerGroup);
     }
   }
@@ -37524,7 +37626,7 @@ body.ww9-special-hazard-mode .ww9SpecialLegacy{display:none!important}
     if(!state.storms.length){el.stormList.innerHTML='<div class="ww9-t2-empty">No active systems returned. Manual ATCF ID remains available.</div>';return;}
     el.stormList.innerHTML=state.storms.map(s=>{
       const id=normalizeId(s.long_atcf_id),cat=category(s.winds),active=id===state.stormId;
-      return '<button class="ww9-t2-storm'+(active?' active':'')+'" data-id="'+esc(id)+'" type="button"><span class="ww9-t2-dot" style="--tc:'+cat.color+'">'+hurricaneSymbolSvg(id)+'</span><span><span class="ww9-t2-storm-name">'+esc(s.storm_name||"INVEST")+'</span><span class="ww9-t2-storm-meta">'+esc(cat.short)+' · '+esc(String(s.atcf_id||id).toUpperCase())+' · '+esc(basinLabel(id))+'</span></span><span class="ww9-t2-storm-int">'+esc(windText(s.winds))+'<br>'+esc((s.pressure||"--")+' mb')+'</span></button>';
+      return '<button class="ww9-t2-storm'+(active?' active':'')+'" data-id="'+esc(id)+'" type="button"><span class="ww9-t2-dot" style="--tc:'+cat.color+'">'+hurricaneSymbolSvg(id)+'</span><span><span class="ww9-t2-storm-name">'+esc(s.storm_name||"INVEST")+'</span><span class="ww9-t2-storm-meta">'+esc(cat.short)+' · '+esc(String(s.atcf_id||id).toUpperCase())+' · '+esc(basinLabel(id))+'</span></span><span class="ww9-t2-storm-int">'+esc(windText(s.winds))+'<br>'+esc(tcPressureText(s.pressure))+'</span></button>';
     }).join("");
     el.stormList.querySelectorAll("[data-id]").forEach(b=>b.addEventListener("click",()=>selectStorm(b.dataset.id,true)));
   }
@@ -37533,9 +37635,9 @@ body.ww9-special-hazard-mode .ww9SpecialLegacy{display:none!important}
     const s=state.storm,id=state.stormId;
     if(!id){el.summary.innerHTML='<div class="ww9-t2-summary-main"><div class="ww9-t2-summary-name">NO STORM SELECTED</div><div class="ww9-t2-summary-id">Choose an active system above</div></div><div class="ww9-t2-stat"><div class="ww9-t2-stat-label">Wind</div><div class="ww9-t2-stat-value">--</div></div><div class="ww9-t2-stat"><div class="ww9-t2-stat-label">Pressure</div><div class="ww9-t2-stat-value">--</div></div>';el.summaryFoot.textContent="";el.selectedSource.textContent="—";if(el.officialProvider)el.officialProvider.textContent="NHC · ATCF · Esri/JTWC";renderProducts();return;}
     const cat=category(s&&s.winds),name=(s&&s.storm_name)||"MANUAL ATCF SYSTEM";
-    el.summary.innerHTML='<div class="ww9-t2-summary-main"><div class="ww9-t2-summary-name" style="color:'+cat.color+'">'+esc(name)+'</div><div class="ww9-t2-summary-id">'+esc(id.toUpperCase())+' · '+esc(basinLabel(id))+' · '+esc((s&&s.cyclone_nature)||cat.name)+'</div></div><div class="ww9-t2-stat"><div class="ww9-t2-stat-label">Wind</div><div class="ww9-t2-stat-value">'+esc(windText(s&&s.winds))+'</div></div><div class="ww9-t2-stat"><div class="ww9-t2-stat-label">Pressure</div><div class="ww9-t2-stat-value">'+esc(s&&s.pressure?s.pressure+' mb':'--')+'</div></div>';
-    const lat=safeNum(s&&s.latitude),lng=safeNum(s&&s.longitude),analysis=String(s&&s.analysis_time||"").replace(".000Z","Z");
-    el.summaryFoot.textContent=[analysis?"Analysis "+analysis:"",lat!==null&&lng!==null?lat.toFixed(1)+"°, "+lng.toFixed(1)+"°":""].filter(Boolean).join(" · ");
+    el.summary.innerHTML='<div class="ww9-t2-summary-main"><div class="ww9-t2-summary-name" style="color:'+cat.color+'">'+esc(name)+'</div><div class="ww9-t2-summary-id">'+esc(id.toUpperCase())+' · '+esc(basinLabel(id))+' · '+esc((s&&s.cyclone_nature)||cat.name)+'</div></div><div class="ww9-t2-stat"><div class="ww9-t2-stat-label">Wind</div><div class="ww9-t2-stat-value">'+esc(windText(s&&s.winds))+'</div></div><div class="ww9-t2-stat"><div class="ww9-t2-stat-label">Pressure</div><div class="ww9-t2-stat-value">'+esc(tcPressureText(s&&s.pressure))+'</div></div>';
+    const lat=tcLatNum(s&&s.latitude),lng=tcLonNum(s&&s.longitude),analysis=String(s&&s.analysis_time||"").replace(".000Z","Z"),motion=tcStormMotionText(s);
+    el.summaryFoot.textContent=[analysis?"Analysis "+analysis:"",lat!==null&&lng!==null?lat.toFixed(1)+"°, "+lng.toFixed(1)+"°":"",motion?"Motion "+motion:""].filter(Boolean).join(" · ");
     el.selectedSource.textContent=String(s&&s.provider||((id.slice(0,2)==="wp"||id.slice(0,2)==="io"||id.slice(0,2)==="sh")?"JTWC / Esri":"NHC / Esri"));
     if(el.officialProvider)el.officialProvider.textContent=(id.slice(0,2)==="wp"||id.slice(0,2)==="io"||id.slice(0,2)==="sh")?"ATCF · Esri/JTWC · TCGP":"NHC/CPHC · ATCF · Esri";
     if(el.aLink)el.aLink.href=NHC_ATCF+"aid_public/a"+id+".dat.gz";
@@ -37557,8 +37659,9 @@ body.ww9-special-hazard-mode .ww9SpecialLegacy{display:none!important}
     const asset=function(x,key){return x&&x[key||"kmzFile"]?String(x[key||"kmzFile"]):""};
     return{
       long_atcf_id:id,atcf_id:id.slice(0,4),storm_name:String(s.name||"TROPICAL SYSTEM"),
-      winds:Number(s.intensity)||0,pressure:Number(s.pressure)||0,
-      latitude:safeNum(s.latitudeNumeric),longitude:safeNum(s.longitudeNumeric),
+      winds:tcWindNum(s.intensity)??0,pressure:tcPressureNum(s.pressure)??0,
+      latitude:tcLatNum(s.latitudeNumeric),longitude:tcLonNum(s.longitudeNumeric),
+      movement_dir:tcMotionDirNum(s.movementDir),movement_speed:tcMotionSpeedNum(s.movementSpeed),
       analysis_time:String(s.lastUpdate||""),cyclone_nature:String(s.classification||""),
       bin_number:String(s.binNumber||""),
       advisory_number:String((s.forecastTrack&&s.forecastTrack.advNum)||(s.publicAdvisory&&s.publicAdvisory.advNum)||""),
@@ -37584,9 +37687,11 @@ body.ww9-special-hazard-mode .ww9SpecialLegacy{display:none!important}
       long_atcf_id:id,
       atcf_id:String(s.atcf_id||id.slice(0,4)).toLowerCase(),
       storm_name:String(s.storm_name||"TROPICAL SYSTEM"),
-      winds:Number(s.winds)||0,
-      pressure:Number(s.pressure)||0,
-      latitude:safeNum(s.latitude),longitude:safeNum(s.longitude),
+      winds:tcWindNum(s.winds)??0,
+      pressure:tcPressureNum(s.pressure)??0,
+      latitude:tcLatNum(s.latitude),longitude:tcLonNum(s.longitude),
+      movement_dir:tcMotionDirNum(s.movement_dir!=null?s.movement_dir:(s.movementDir!=null?s.movementDir:(s.motion_dir!=null?s.motion_dir:s.motionDir))),
+      movement_speed:tcMotionSpeedNum(s.movement_speed!=null?s.movement_speed:(s.movementSpeed!=null?s.movementSpeed:(s.motion_speed!=null?s.motion_speed:s.motionSpeed))),
       analysis_time:String(s.analysis_time||s.last_updated||""),
       cyclone_nature:String(s.cyclone_nature||""),
       advisory_number:"",bin_number:"",
@@ -37634,9 +37739,10 @@ body.ww9-special-hazard-mode .ww9SpecialLegacy{display:none!important}
   function validStormArray(list){
     const byId=new Map();
     for(const storm of (list||[])){
-      const id=normalizeId(storm&&storm.long_atcf_id);if(!id||safeNum(storm.latitude)===null||safeNum(storm.longitude)===null)continue;
-      const old=byId.get(id),nt=Date.parse(storm.analysis_time||"")||0,ot=old?(Date.parse(old.analysis_time||"")||0):-1;
-      if(!old||nt>=ot)byId.set(id,storm);
+      const id=normalizeId(storm&&storm.long_atcf_id),lat=tcLatNum(storm&&storm.latitude),lon=tcLonNum(storm&&storm.longitude);if(!id||lat===null||lon===null)continue;
+      const clean=Object.assign({},storm,{latitude:lat,longitude:lon,winds:tcWindNum(storm&&storm.winds)??0,pressure:tcPressureNum(storm&&storm.pressure)??0});
+      const old=byId.get(id),nt=Date.parse(clean.analysis_time||"")||0,ot=old?(Date.parse(old.analysis_time||"")||0):-1;
+      if(!old||nt>=ot)byId.set(id,clean);
     }
     return Array.from(byId.values()).sort((a,b)=>String(a.long_atcf_id).localeCompare(String(b.long_atcf_id)));
   }
@@ -37789,17 +37895,17 @@ body.ww9-special-hazard-mode .ww9SpecialLegacy{display:none!important}
     if(id&&text.toUpperCase().indexOf(id.toUpperCase())<0&&name&&name!=="TROPICAL SYSTEM"&&text.toUpperCase().indexOf(name)<0)throw new Error("TCM did not match selected storm");
     const points=[],lines=text.split("\n"),taus=[12,24,36,48,60,72,96,120];let current=null,forecastIndex=0,pressure=null,motionDir=null,motionSpd=null,advisnum="";
     const adv=text.match(/FORECAST\/ADVISORY NUMBER\s+([0-9A-Z.-]+)/i);if(adv)advisnum=adv[1];
-    const pm=text.match(/ESTIMATED MINIMUM CENTRAL PRESSURE\s+(\d+)\s+MB/i);if(pm)pressure=Number(pm[1]);
-    const initialWind=text.match(/MAX SUSTAINED WINDS\s+(\d+)\s+KT(?:\s+WITH GUSTS TO\s+(\d+)\s+KT)?/i),initialGust=initialWind?(Number(initialWind[2])||0):0;
-    const mov=text.match(/PRESENT MOVEMENT[^\n]*?OR\s+(\d+)\s+DEGREES\s+AT\s+(\d+)\s+KT/i);if(mov){motionDir=Number(mov[1]);motionSpd=Number(mov[2])}
+    const pm=text.match(/ESTIMATED MINIMUM CENTRAL PRESSURE\s+(\d+)\s+MB/i);if(pm){const p=tcPressureNum(pm[1]);if(p!==null)pressure=p}
+    const initialWind=text.match(/MAX SUSTAINED WINDS\s+(\d+)\s+KT(?:\s+WITH GUSTS TO\s+(\d+)\s+KT)?/i),initialWindKt=initialWind?tcWindNum(initialWind[1]):null,initialGust=initialWind?(tcWindNum(initialWind[2])??0):0;
+    const mov=text.match(/PRESENT MOVEMENT[^\n]*?OR\s+(\d+)\s+DEGREES\s+AT\s+(\d+)\s+KT/i);if(mov){motionDir=tcMotionDirNum(mov[1]);motionSpd=tcMotionSpeedNum(mov[2])}
     function pushCurrent(){if(current&&Number.isFinite(current.lat)&&Number.isFinite(current.lon)){points.push(current);current=null}}
     for(let i=0;i<lines.length;i++){
       const line=lines[i];let m=line.match(/TROPICAL (?:STORM|CYCLONE|DEPRESSION) CENTER LOCATED NEAR\s+(\d+(?:\.\d+)?)([NS])\s+(\d+(?:\.\d+)?)([EW])\s+AT\s+(\d{2})\/(\d{4})Z/i)||line.match(/(?:HURRICANE|SUBTROPICAL STORM|SUBTROPICAL DEPRESSION) CENTER LOCATED NEAR\s+(\d+(?:\.\d+)?)([NS])\s+(\d+(?:\.\d+)?)([EW])\s+AT\s+(\d{2})\/(\d{4})Z/i);
-      if(m&&!points.length&&!current){current={lat:tcmCoord(m[1],m[2]),lon:tcmCoord(m[3],m[4]),tau:0,wind:Number(storm&&storm.winds)||0,pressure:pressure||Number(storm&&storm.pressure)||0,gust:initialGust,stormtype:String(storm&&storm.cyclone_nature||""),stormname:String(storm&&storm.storm_name||""),validtime:String(storm&&storm.analysis_time||issuanceTime||""),tcdir:motionDir,tcspd:motionSpd,advisnum,radii:{}};continue}
+      if(m&&!points.length&&!current){current={lat:tcLatNum(tcmCoord(m[1],m[2])),lon:tcLonNum(tcmCoord(m[3],m[4])),tau:0,wind:initialWindKt??tcWindNum(storm&&storm.winds)??0,pressure:pressure??tcPressureNum(storm&&storm.pressure)??0,gust:initialGust,stormtype:String(storm&&storm.cyclone_nature||""),stormname:String(storm&&storm.storm_name||""),validtime:String(storm&&storm.analysis_time||issuanceTime||""),tcdir:motionDir,tcspd:motionSpd,advisnum,radii:{}};continue}
       m=line.match(/^\s*FORECAST VALID\s+(\d{2})\/(\d{4})Z\s+(\d+(?:\.\d+)?)([NS])\s+(\d+(?:\.\d+)?)([EW])(.*)$/i);
-      if(m){pushCurrent();current={lat:tcmCoord(m[3],m[4]),lon:tcmCoord(m[5],m[6]),tau:taus[Math.min(forecastIndex,taus.length-1)],wind:0,pressure:0,gust:0,stormtype:String(m[7]||"").replace(/^\.*\s*/,"").trim(),stormname:String(storm&&storm.storm_name||""),validtime:tcmValidIso(m[1],m[2],issuanceTime||storm&&storm.analysis_time||Date.now()),tcdir:null,tcspd:null,advisnum,radii:{}};forecastIndex++;continue}
+      if(m){pushCurrent();current={lat:tcLatNum(tcmCoord(m[3],m[4])),lon:tcLonNum(tcmCoord(m[5],m[6])),tau:taus[Math.min(forecastIndex,taus.length-1)],wind:0,pressure:0,gust:0,stormtype:String(m[7]||"").replace(/^\.*\s*/,"").trim(),stormname:String(storm&&storm.storm_name||""),validtime:tcmValidIso(m[1],m[2],issuanceTime||storm&&storm.analysis_time||Date.now()),tcdir:null,tcspd:null,advisnum,radii:{}};forecastIndex++;continue}
       if(current){
-        m=line.match(/^\s*MAX WIND\s+(\d+)\s+KT(?:\.*\s*GUSTS\s+(\d+)\s+KT)?/i);if(m){current.wind=Number(m[1]);current.gust=Number(m[2])||0;continue}
+        m=line.match(/^\s*MAX WIND\s+(\d+)\s+KT(?:\.*\s*GUSTS\s+(\d+)\s+KT)?/i);if(m){current.wind=tcWindNum(m[1])??0;current.gust=tcWindNum(m[2])??0;continue}
         m=line.match(/^\s*(34|50|64)\s+KT\.*\s*(\d+)\s*NE\s+(\d+)\s*SE\s+(\d+)\s*SW\s+(\d+)\s*NW/i);if(m){current.radii[Number(m[1])]=[Number(m[2]),Number(m[3]),Number(m[4]),Number(m[5])];continue}
       }
     }
@@ -37807,11 +37913,13 @@ body.ww9-special-hazard-mode .ww9SpecialLegacy{display:none!important}
     const forecastFeatures=points.map(p=>({type:"Feature",properties:{stormname:p.stormname,stormtype:p.stormtype,tau:p.tau,maxwind:p.wind,gust:p.gust,mslp:p.pressure,lat:p.lat,lon:p.lon,tcdir:p.tcdir,tcspd:p.tcspd,validtime:p.validtime,advisnum:p.advisnum,source:"NWS TCM",radii34:p.radii[34]||null,radii50:p.radii[50]||null,radii64:p.radii[64]||null},geometry:{type:"Point",coordinates:[p.lon,p.lat]}}));
     forecastFeatures.unshift({type:"Feature",properties:{stormname:String(storm&&storm.storm_name||""),source:"NWS TCM"},geometry:{type:"LineString",coordinates:points.map(p=>[p.lon,p.lat])}});
     const cone=tcmConeFeature(points,id),wind=[];for(const p of points)for(const threshold of [34,50,64]){const f=tcmWindPolygon(p,threshold,p.radii[threshold]);if(f)wind.push(f)}
-    return{forecast:{type:"FeatureCollection",features:forecastFeatures},cone:{type:"FeatureCollection",features:cone?[cone]:[]},wind:{type:"FeatureCollection",features:wind},text,advisnum,source:"NWS Forecast/Advisory"}
+    const nowPoint=points.find(p=>p&&p.tau===0)||points[0]||null;
+    const currentSnapshot=nowPoint?{pressure:tcPressureNum(nowPoint.pressure),winds:tcWindNum(nowPoint.wind),movement_dir:tcMotionDirNum(nowPoint.tcdir),movement_speed:tcMotionSpeedNum(nowPoint.tcspd),latitude:tcLatNum(nowPoint.lat),longitude:tcLonNum(nowPoint.lon),analysis_time:nowPoint.validtime||""}:null;
+    return{forecast:{type:"FeatureCollection",features:forecastFeatures},cone:{type:"FeatureCollection",features:cone?[cone]:[]},wind:{type:"FeatureCollection",features:wind},text,advisnum,current:currentSnapshot,source:"NWS Forecast/Advisory"}
   }
   async function fetchNwsTcmBundle(storm){
     const id=normalizeId(storm&&storm.long_atcf_id);if(!isNhcBasin(id))throw new Error("TCM is only available for NHC/CPHC basins");
-    const cache=WW9_TCM_CACHE.get(id);if(cache&&Date.now()-cache.time<900000)return cache.data;if(WW9_TCM_PENDING.has(id))return WW9_TCM_PENDING.get(id);
+    const cache=WW9_TCM_CACHE.get(id);if(cache&&Date.now()-cache.time<900000){mergeCurrentAdvisoryIntoStorm(storm,cache.data&&cache.data.current,"NWS Forecast/Advisory");return cache.data}if(WW9_TCM_PENDING.has(id))return WW9_TCM_PENDING.get(id);
     const pending=(async()=>{
       const office=id.slice(0,2)==="cp"?"PHFO":"KNHC",url="https://api.weather.gov/products?"+new URLSearchParams({type:"TCM",office,limit:"50"}).toString();
       const r=await timeoutFetch(url,{cache:"no-cache",headers:{Accept:"application/ld+json, application/json"}},5500);if(!r.ok)throw new Error("NWS products HTTP "+r.status);const j=await r.json(),rows=Array.isArray(j&&j["@graph"])?j["@graph"]:[];
@@ -37823,7 +37931,7 @@ body.ww9-special-hazard-mode .ww9SpecialLegacy{display:none!important}
           let product=row,text=String(row&&row.productText||"");
           if(!text){let u=String(row&&row["@id"]||"");if(!u&&row&&row.id)u="https://api.weather.gov/products/"+encodeURIComponent(row.id);if(!u)continue;const pr=await timeoutFetch(u,{cache:"no-cache",headers:{Accept:"application/ld+json, application/json"}},4500);if(!pr.ok)continue;product=await pr.json();text=String(product&&product.productText||"")}
           const up=text.toUpperCase();if(!up.includes(id.toUpperCase())&&stormName&&!up.includes(stormName))continue;
-          const data=parseTcmForecast(text,storm,product&&product.issuanceTime||row&&row.issuanceTime||"");WW9_TCM_CACHE.set(id,{time:Date.now(),data});return data;
+          const data=parseTcmForecast(text,storm,product&&product.issuanceTime||row&&row.issuanceTime||"");mergeCurrentAdvisoryIntoStorm(storm,data&&data.current,"NWS Forecast/Advisory");WW9_TCM_CACHE.set(id,{time:Date.now(),data});return data;
         }catch(e){last=e}
       }
       throw last||new Error("No matching NWS Forecast/Advisory found");
@@ -37975,20 +38083,29 @@ body.ww9-special-hazard-mode .ww9SpecialLegacy{display:none!important}
     try{return d.toLocaleString([], {weekday:"short",month:"short",day:"numeric",hour:"numeric",minute:"2-digit",timeZone:"UTC",timeZoneName:"short"})}catch(_e){return d.toISOString().replace("T"," ").slice(0,16)+"Z"}
   }
   function forecastPointPopup(f){
-    const name=prop(f,"stormname")||"Forecast point",tau=safeNum(prop(f,"tau")),wind=safeNum(prop(f,"maxwind")),gust=safeNum(prop(f,"gust")),mslp=safeNum(prop(f,"mslp"));
-    const gc=f&&f.geometry&&f.geometry.type==="Point"&&Array.isArray(f.geometry.coordinates)?f.geometry.coordinates:null,lat=safeNum(prop(f,"lat"))!==null?safeNum(prop(f,"lat")):(gc?safeNum(gc[1]):null),lon=safeNum(prop(f,"lon"))!==null?safeNum(prop(f,"lon")):(gc?safeNum(gc[0]):null),dir=safeNum(prop(f,"tcdir")),spd=safeNum(prop(f,"tcspd")),adv=prop(f,"advisnum"),type=prop(f,"stormtype")||prop(f,"dvlbl")||prop(f,"tcdvlp")||"";
+    const name=prop(f,"stormname")||"Forecast point",tau=safeNum(prop(f,"tau")),wind=tcWindNum(prop(f,"maxwind")),gust=tcWindNum(prop(f,"gust"));
+    let mslp=tcPressureNum(prop(f,"mslp"));
+    const gc=f&&f.geometry&&f.geometry.type==="Point"&&Array.isArray(f.geometry.coordinates)?f.geometry.coordinates:null,plat=tcLatNum(prop(f,"lat")),plon=tcLonNum(prop(f,"lon")),lat=plat!==null?plat:(gc?tcLatNum(gc[1]):null),lon=plon!==null?plon:(gc?tcLonNum(gc[0]):null),adv=prop(f,"advisnum"),type=prop(f,"stormtype")||prop(f,"dvlbl")||prop(f,"tcdvlp")||"";
+    let dir=tcMotionDirNum(prop(f,"tcdir")),spd=tcMotionSpeedNum(prop(f,"tcspd")),explicitStationary=false;
+    if(tau===0){
+      const stormPressure=tcPressureNum(state.storm&&state.storm.pressure),stormDir=tcMotionDirNum(state.storm&&state.storm.movement_dir),stormSpd=tcMotionSpeedNum(state.storm&&state.storm.movement_speed);
+      if(mslp===null&&stormPressure!==null)mslp=stormPressure;
+      if(stormDir!==null&&stormSpd!==null){dir=stormDir;spd=stormSpd;explicitStationary=stormSpd===0}
+      else if(spd===0){dir=null;spd=null}
+    }else if(spd===0){dir=null;spd=null}
     const valid=fmtOfficialTime(prop(f,"validtime")||prop(f,"fldatelbl")||prop(f,"datelbl"));
     const rows=[];
     if(valid)rows.push(["Valid",valid]);if(tau!==null)rows.push(["Forecast hour","F"+Math.round(tau)]);if(type)rows.push(["Type",String(type)]);
-    if(wind!==null)rows.push(["Wind",Math.round(wind)+" kt · "+Math.round(wind*1.15078)+" mph"]);if(gust!==null&&gust>0)rows.push(["Gust",Math.round(gust)+" kt · "+Math.round(gust*1.15078)+" mph"]);if(mslp!==null&&mslp>0)rows.push(["Pressure",Math.round(mslp)+" mb"]);
+    if(wind!==null)rows.push(["Wind",Math.round(wind)+" kt · "+Math.round(wind*1.15078)+" mph"]);if(gust!==null&&gust>0)rows.push(["Gust",Math.round(gust)+" kt · "+Math.round(gust*1.15078)+" mph"]);if(mslp!==null)rows.push(["Pressure",Math.round(mslp)+" mb"]);
     if(lat!==null&&lon!==null)rows.push(["Position",Math.abs(lat).toFixed(1)+"°"+(lat>=0?"N":"S")+" · "+Math.abs(lon).toFixed(1)+"°"+(lon>=0?"E":"W")]);
-    if(dir!==null&&spd!==null&&spd>=0)rows.push(["Motion",String(Math.round(dir)).padStart(3,"0")+"° at "+Math.round(spd)+" kt"]);if(adv)rows.push(["Advisory",String(adv)]);
+    if(explicitStationary)rows.push(["Motion","Stationary"]);else if(dir!==null&&spd!==null&&spd>0)rows.push(["Motion",String(Math.round(dir)).padStart(3,"0")+"° at "+Math.round(spd)+" kt"]);if(adv)rows.push(["Advisory",String(adv)]);
     return '<div class="ww9-t2-point-popup"><div class="ww9-t2-point-title">'+esc(name)+'</div>'+rows.map(r=>'<div class="ww9-t2-point-row"><span>'+esc(r[0])+'</span><b>'+esc(r[1])+'</b></div>').join("")+'<div class="ww9-t2-point-foot">Official tropical forecast point</div></div>';
   }
   function officialTooltip(kind,f){
     if(kind==="forecast"){
-      const tau=safeNum(prop(f,"tau")),wind=safeNum(prop(f,"maxwind")),mslp=safeNum(prop(f,"mslp"));
-      return '<b>'+esc(prop(f,"stormname")||"Forecast point")+'</b><br>'+esc(tau!==null?"F"+Math.round(tau):prop(f,"fldatelbl")||prop(f,"validtime")||"")+(wind!==null?'<br>'+esc(Math.round(wind)+" kt")+(mslp!==null&&mslp>0?" · "+esc(Math.round(mslp)+" mb"):""):"");
+      const tau=safeNum(prop(f,"tau")),wind=tcWindNum(prop(f,"maxwind"));let mslp=tcPressureNum(prop(f,"mslp"));
+      if(tau===0&&mslp===null)mslp=tcPressureNum(state.storm&&state.storm.pressure);
+      return '<b>'+esc(prop(f,"stormname")||"Forecast point")+'</b><br>'+esc(tau!==null?"F"+Math.round(tau):prop(f,"fldatelbl")||prop(f,"validtime")||"")+(wind!==null?'<br>'+esc(Math.round(wind)+" kt")+(mslp!==null?" · "+esc(Math.round(mslp)+" mb"):""):"");
     }
     if(kind==="wwa")return '<b>'+esc(({HWR:"Hurricane Warning",HWA:"Hurricane Watch",TWR:"Tropical Storm Warning",TWA:"Tropical Storm Watch"})[String(prop(f,"tcww")||"").toUpperCase()]||"Tropical watch/warning")+'</b>';
     if(kind==="outlook")return '<b>7-Day Tropical Outlook</b><br>'+esc(prop(f,"prob7day")||"")+" development chance";
@@ -37998,6 +38115,14 @@ body.ww9-special-hazard-mode .ww9SpecialLegacy{display:none!important}
     const isOutlook=kind==="outlook";
     const filtered={type:"FeatureCollection",features:(data.features||[]).filter(f=>skipFilter||isOutlook||featureMatchesStorm(f))};
     if(!filtered.features.length)return null;
+    if(kind==="forecast"&&state.storm){
+      const f0=filtered.features.find(f=>f&&f.geometry&&f.geometry.type==="Point"&&safeNum(prop(f,"tau"))===0);
+      if(f0){
+        const mslp=tcPressureNum(prop(f0,"mslp")),wind=tcWindNum(prop(f0,"maxwind")),dir=tcMotionDirNum(prop(f0,"tcdir")),spd=tcMotionSpeedNum(prop(f0,"tcspd")),current={pressure:mslp,winds:wind};
+        if(dir!==null&&spd!==null&&spd>0){current.movement_dir=dir;current.movement_speed=spd}
+        mergeCurrentAdvisoryIntoStorm(state.storm,current,String(prop(f0,"source")||"official forecast"));
+      }
+    }
     return L.geoJSON(filtered,{pane:"tropicalV2OfficialPane",renderer:state.officialRenderer,style:f=>officialStyle(kind,f),pointToLayer:(f,ll)=>pointForOfficial(kind,f,ll),onEachFeature:(f,l)=>{
       if(l&&l.bindTooltip)l.bindTooltip(officialTooltip(kind,f),{className:"ww9-t2-tooltip",sticky:true,direction:"top"});
       if(kind==="forecast"&&f&&f.geometry&&f.geometry.type==="Point"&&l&&l.bindPopup){l.bindPopup(forecastPointPopup(f),{className:"ww9-t2-leaflet-popup",maxWidth:285,closeButton:true,autoPan:true});if(l.getElement)l.on("add",()=>{const node=l.getElement();if(node)node.style.cursor="pointer"})}
@@ -38050,7 +38175,7 @@ body.ww9-special-hazard-mode .ww9SpecialLegacy{display:none!important}
       if(!line.trim())return;const f=line.split(",").map(v=>v.trim());if(f.length<10)return;
       const cycle=f[2],aid=String(f[4]||"").toUpperCase(),tau=Number(f[5]),lat=parseCoord(f[6]),lng=parseCoord(f[7]);
       if(!/^\d{10}$/.test(cycle)||!aid||!Number.isFinite(tau)||!Number.isFinite(lat)||!Number.isFinite(lng))return;
-      const row={cycle,aid,tau,lat,lng,wind:Number(f[8])||0,pressure:Number(f[9])||0,type:String(f[10]||"")};
+      const row={cycle,aid,tau,lat,lng,wind:tcWindNum(f[8])??0,pressure:tcPressureNum(f[9])??0,type:String(f[10]||"")};
       if(bestOnly){if(aid!=="BEST")return;const key=cycle+"|"+lat+"|"+lng;if(bestSeen.has(key))return;bestSeen.add(key);best.push(row);return}
       if(tau<0||tau>240)return;
       let bucket=cycleMap.get(cycle);if(!bucket){bucket={seen:new Set(),rows:[]};cycleMap.set(cycle,bucket)}
@@ -45507,8 +45632,7 @@ function applyHealthToMarker(id){
   if(!mk)return;
   mk._ww9HealthState=h&&h.state||'unknown';
   try{
-    const el=mk.getElement&&mk.getElement();
-    const btn=el&&el.querySelector&&el.querySelector('.ww9-site-button');
+    const btn=typeof markerButton==='function'?markerButton(mk):(mk.getElement&&mk.getElement()?.querySelector?.('.ww9-site-button'));
     if(btn){
       btn.classList.toggle('is-health-stale',!!(h&&h.state==='stale'));
       btn.classList.toggle('is-health-down',!!(h&&h.state==='down'));
@@ -45648,18 +45772,28 @@ async function runHealthCycle(){
   try{
     const m=getMap(),bounds=m&&m.getBounds?m.getBounds():null;
     const coords=api.coords||{};
-    const records=api.sites.filter(healthEligible);
-
-
+    const allRecords=api.sites.filter(healthEligible);
     const selected=String(api.currentSite||'').toUpperCase();
     const center=m&&m.getCenter?m.getCenter():null;
+    const zoom=m&&m.getZoom?Number(m.getZoom()):0;
+    function isVisible(rec){const id=String(rec.id||'').toUpperCase(),c=coords[id]||rec.coord;return id===selected||!!(bounds&&c&&bounds.contains&&bounds.contains([+c[0],+c[1]]))}
     function priority(rec){
       const id=String(rec.id||'').toUpperCase(),c=coords[id]||rec.coord;
       if(id===selected)return -1000000;
-      const visible=!!(bounds&&c&&bounds.contains&&bounds.contains([+c[0],+c[1]]));
-      if(visible)return -500000;
+      if(isVisible(rec))return -500000;
       if(center&&c){const dy=Number(c[0])-Number(center.lat),dx=Number(c[1])-Number(center.lng);return dy*dy+dx*dx;}
       return 1000000;
+    }
+    // At regional/local zooms, don't parse hundreds of off-screen AWS listings.
+    // Keep every on-screen/selected radar current and rotate a small stale background batch.
+    let records=allRecords;
+    if(Number.isFinite(zoom)&&zoom>4.5){
+      const visible=allRecords.filter(isVisible),visibleIds=new Set(visible.map(r=>String(r.id||'').toUpperCase()));
+      const background=allRecords.filter(r=>{
+        const id=String(r.id||'').toUpperCase();if(visibleIds.has(id))return false;
+        const h=healthBySite.get(id);return !h||Date.now()-Number(h.checkedAt||0)>30*60*1000;
+      }).sort((a,b)=>priority(a)-priority(b)).slice(0,window.WW9_LOW_POWER?6:16);
+      records=visible.concat(background);
     }
     records.sort((a,b)=>priority(a)-priority(b));
     if(window.WW9_LOW_POWER&&records.length>42)records.length=42;
@@ -45685,10 +45819,9 @@ async function runHealthCycle(){
     await Promise.all(window.WW9_LOW_POWER?[worker(),worker()]:[worker(),worker(),worker(),worker()]);
   }finally{
     healthCycleRunning=false;
-    clearTimeout(healthCycleTimer);
-    healthCycleTimer=setTimeout(runHealthCycle,HEALTH_REFRESH_MS);
   }
 }
+window.WW9PerfScheduler.every('radar-site-health-cycle',HEALTH_REFRESH_MS,runHealthCycle,{visibleOnly:true,when:function(){return normalSitesShouldShow()||tdwrSitesShouldShow()},noOverlap:true});
 function normalSitesShouldShow(){
   try{const t=document.getElementById('radarSitesLayerToggle');if(t)return !!t.checked}catch(e){}
   try{return (localStorage.getItem('wp_radarPillsVisible')||'1')!=='0'}catch(e){}
@@ -45711,10 +45844,17 @@ function ensureLayers(){
   if(tdwrSitesShouldShow()){if(!m.hasLayer(tdwrLayer))tdwrLayer.addTo(m)}else if(m.hasLayer(tdwrLayer))m.removeLayer(tdwrLayer);
   return {siteLayer,tdwrLayer};
 }
-function updateActive(site){
-  activeSite=String(site||'').toUpperCase();markerBySite.forEach((mk,id)=>{try{const el=mk.getElement&&mk.getElement(),b=el&&el.querySelector&&el.querySelector('.ww9-site-button');if(b){const on=id===activeSite;b.classList.toggle('is-active',on);b.setAttribute('aria-pressed',on?'true':'false')}applyHealthToMarker(id)}catch(e){}});
+function markerButton(mk){
+  if(!mk)return null;if(mk._ww9ButtonEl&&mk._ww9ButtonEl.isConnected)return mk._ww9ButtonEl;
+  try{const el=mk.getElement&&mk.getElement(),b=el&&el.querySelector&&el.querySelector('.ww9-site-button');if(b)mk._ww9ButtonEl=b;return b||null}catch(e){return null}
 }
-function setLoading(site,on){const mk=markerBySite.get(String(site||'').toUpperCase());if(!mk)return;try{const el=mk.getElement&&mk.getElement(),b=el&&el.querySelector&&el.querySelector('.ww9-site-button');if(b)b.classList.toggle('is-loading',!!on)}catch(e){}}
+function setMarkerActive(id,on){const mk=markerBySite.get(String(id||'').toUpperCase());if(!mk)return;try{const b=markerButton(mk);if(b){b.classList.toggle('is-active',!!on);b.setAttribute('aria-pressed',on?'true':'false')}}catch(e){}}
+function updateActive(site){
+  const next=String(site||'').toUpperCase(),prev=activeSite;activeSite=next;
+  if(prev&&prev!==next)setMarkerActive(prev,false);
+  if(next)setMarkerActive(next,true);
+}
+function setLoading(site,on){const mk=markerBySite.get(String(site||'').toUpperCase());if(!mk)return;try{const b=markerButton(mk);if(b)b.classList.toggle('is-loading',!!on)}catch(e){}}
 async function chooseSite(site){
   site=String(site||'').toUpperCase();const api=getApi();if(!api||!site)return;
   const rec=(api.sites||[]).find(s=>String(s.id).toUpperCase()===site);if(!rec)return;
@@ -45735,7 +45875,7 @@ function makeMarker(rec,coord){
   const extra=(net==='CANADA'?' is-canada':(net==='COLOMBIA'?' is-colombia':((net==='FINLAND'||net==='FINLAND_COMPOSITE')?' is-finland':(net==='UK_COMPOSITE'?' is-uk':(net==='TDWR'?' is-tdwr':(net==='BOWMAN'?' is-bowman':''))))))+markerHealthClass(id);
   const icon=L.divIcon({className:'ww9-site-button-wrap',html:'<button type="button" class="ww9-site-button'+extra+'" data-site="'+id+'" aria-label="Load '+id+' '+name.replace(/"/g,'&quot;')+' radar" aria-pressed="false">'+id+'</button>',iconSize:[42,18],iconAnchor:[21,9]});
   const mk=L.marker([+coord[0],+coord[1]],{icon,pane:'ww9RadarSiteButtonPane',interactive:true,keyboard:false,riseOnHover:false});mk._ww9FreshSiteId=id;mk._ww9RadarName=name;
-  mk.on('add',function(){const el=mk.getElement&&mk.getElement(),btn=el&&el.querySelector&&el.querySelector('.ww9-site-button');if(!btn||btn.__ww9FreshBound)return;btn.__ww9FreshBound=true;['pointerdown','mousedown','touchstart','dblclick'].forEach(type=>btn.addEventListener(type,ev=>ev.stopPropagation(),true));btn.addEventListener('click',function(ev){ev.preventDefault();ev.stopPropagation();chooseSite(id)},true);updateActive(activeSite);applyHealthToMarker(id)});
+  mk.on('add',function(){const el=mk.getElement&&mk.getElement(),btn=el&&el.querySelector&&el.querySelector('.ww9-site-button');if(!btn)return;mk._ww9ButtonEl=btn;if(!btn.__ww9FreshBound){btn.__ww9FreshBound=true;['pointerdown','mousedown','touchstart','dblclick'].forEach(type=>btn.addEventListener(type,ev=>ev.stopPropagation(),true));btn.addEventListener('click',function(ev){ev.preventDefault();ev.stopPropagation();chooseSite(id)},true)}btn.classList.toggle('is-active',id===activeSite);btn.setAttribute('aria-pressed',id===activeSite?'true':'false');applyHealthToMarker(id)});
   mk.bindTooltip(id+' — '+name,{direction:'top',offset:[0,-8],opacity:.94});return mk;
 }
 function validCatalogEntries(){
@@ -45942,9 +46082,7 @@ try{const oldPane=m&&m.getPane&&m.getPane('ww9AwsRadarSitePane');if(oldPane){old
     }catch(e){}
 
 
-    setInterval(function(){
-      if(!document.hidden)ensureSiteLayerIntegrity('watchdog');
-    },window.WW9_LOW_POWER?12000:5000);
+    window.WW9PerfScheduler.every('radar-site-integrity',window.WW9_LOW_POWER?90000:60000,function(){ensureSiteLayerIntegrity('watchdog')},{visibleOnly:true});
   }
 
   clearTimeout(healthCycleTimer);
@@ -47637,7 +47775,7 @@ function buildUi(){
 function boot(){
   loadState();loadNwsVisual();var tries=0;(function ui(){var a=buildUi(),b=buildNwsVisualUi();if(a&&b)return;if(++tries<60)setTimeout(ui,150)})();
   ensurePane();syncInputs();if(state.important||state.other)refresh();
-  state.timer=setInterval(function(){if(!document.hidden&&(state.important||state.other)&&!state.archive)refresh()},window.WW9_LOW_POWER?90000:60000);
+  state.timer=window.WW9PerfScheduler.every('nws-alerts-refresh',window.WW9_LOW_POWER?90000:60000,refresh,{visibleOnly:true,when:function(){return(state.important||state.other)&&!state.archive},noOverlap:true});
 
   window.addEventListener('ww9archiveviewtime',function(e){
     const t=e&&e.detail&&e.detail.time?new Date(e.detail.time):null;
@@ -48008,9 +48146,7 @@ function boot(){
   syncInput();
 
   if(state.enabled)refresh();
-  state.timer=setInterval(function(){
-    if(!document.hidden&&state.enabled)refresh();
-  },window.WW9_LOW_POWER?90000:60000);
+  state.timer=window.WW9PerfScheduler.every('canadian-alerts-refresh',window.WW9_LOW_POWER?90000:60000,refresh,{visibleOnly:true,when:function(){return state.enabled},noOverlap:true});
 }
 if(document.readyState==='loading'){
   document.addEventListener('DOMContentLoaded',boot,{once:true});
@@ -48809,8 +48945,9 @@ function boot(){
     window.addEventListener('ww9archiveexit',syncToolStates);
   }
 
-  if(timer)clearInterval(timer);
-  timer=setInterval(syncControls,window.WW9_LOW_POWER?2200:1000);
+  if(timer){try{window.WW9PerfScheduler.cancel(timer)}catch(e){}timer=null;}
+  timer=window.WW9PerfScheduler.every('radar-app-control-sync',window.WW9_LOW_POWER?45000:30000,syncControls,{visibleOnly:true});
+  if(!document.__ww9RadarModeFocusSync){document.__ww9RadarModeFocusSync=true;window.addEventListener('focus',syncControls,{passive:true});document.addEventListener('visibilitychange',function(){if(!document.hidden)syncControls()},{passive:true});}
 
   let saved=false;
   try{
@@ -49080,8 +49217,8 @@ function buildUi(){
 }
 function boot(){
   loadState();ensurePane();let tries=0;(function ui(){if(buildUi())return;if(++tries<80)setTimeout(ui,120)})();if(state.spotter||state.mping||state.spc)refresh();
-  state.timer=setInterval(function(){if(!document.hidden&&(state.spotter||state.mping||state.spc))refresh()},window.WW9_LOW_POWER?180000:120000);
-  state.pruneTimer=setInterval(function(){if(!document.hidden)pruneReports()},window.WW9_LOW_POWER?30000:15000);
+  state.timer=window.WW9PerfScheduler.every('storm-reports-refresh',window.WW9_LOW_POWER?180000:120000,refresh,{visibleOnly:true,when:function(){return state.spotter||state.mping||state.spc},noOverlap:true});
+  state.pruneTimer=window.WW9PerfScheduler.every('storm-reports-prune',window.WW9_LOW_POWER?30000:15000,pruneReports,{visibleOnly:true,when:function(){return !!state.layer&&(state.spotter||state.mping||state.spc)}});
   const m=mapRef();if(m)m.on('moveend',function(){if(state.mping){clearTimeout(boot._mv);boot._mv=setTimeout(refresh,700)}})
 }
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',boot,{once:true});else boot();
@@ -49454,9 +49591,9 @@ body.ww9-radar-inspect-active .leaflet-container,body.ww9-radar-inspect-active .
     $('ww9AutosaveDeleteSelected').onclick=async function(){var key=$('ww9AutosaveHistorySelect').value;if(!key)return;var s=$('ww9AutosaveHistoryStatus');try{await autosaveDbDelete(key);s.textContent='Snapshot deleted.';await refresh()}catch(e){s.textContent='Delete failed.'}};
     $('ww9AutosaveSaveManual').onclick=async function(){var s=$('ww9AutosaveHistoryStatus'),name=$('ww9AutosaveManualName').value;try{var r=await saveManualAutosaveSnapshot(name);s.textContent='Manual snapshot saved.';$('ww9AutosaveManualName').value='';await refresh();$('ww9AutosaveHistorySelect').value=r.key}catch(e){s.textContent='Save failed.'}};
     $('ww9AutosaveChooseFile').onclick=async function(){var s=$('ww9AutosaveHistoryStatus');try{s.textContent='Choose a JSON autosave file…';var h=await chooseExternalAutosaveFile();s.textContent='Autosaving to '+(h&&h.name?h.name:'selected JSON file')+'.'}catch(e){if(e&&e.name==='AbortError'){s.textContent='File selection canceled.'}else{s.textContent=e&&e.message?e.message:'Could not bind autosave file.'}}};
-    refresh();updateLiveStatus();setInterval(updateLiveStatus,2000);return true;
+    refresh();updateLiveStatus();window.WW9PerfScheduler.every('autosave-status-age',window.WW9_LOW_POWER?30000:15000,updateLiveStatus,{visibleOnly:true});return true;
   }
-  var tries=0,t=setInterval(function(){if(install()||++tries>100)clearInterval(t)},100);
+  window.WW9PerfScheduler.retry('autosave-history-ui',100,101,install);
   window.addEventListener('ww9:autosave-written',function(){refresh();var l=$('ww9AutosaveLiveStatus'),api=window.WW9Autosave;if(l&&api&&api.status){var st=api.status();l.textContent=st.lastWriteAt?'Saved just now':'Autosave ready';}});
   window.addEventListener('ww9:autosave-compact-written',function(){var l=$('ww9AutosaveLiveStatus');if(l)l.textContent='Saved just now';});
 })();
@@ -51380,8 +51517,8 @@ body.ww9-radar-inspect-active .leaflet-container,body.ww9-radar-inspect-active .
       if(gl)gl.on('style.load',()=>{if(ui.viirs&&ui.viirs.checked&&lastViirsData)requestAnimationFrame(()=>renderViirsNative(lastViirsData));});
     }catch(e){}
 
-    refreshTimer=setInterval(()=>{if(activeAny())refresh(true);},5*60*1000);
-    ngfsRefreshTimer=setInterval(()=>{if(ui.ngfs&&ui.ngfs.checked){pruneNgfsStaleData();refreshNgfsOnly();}},NGFS_REFRESH_INTERVAL_MS);
+    refreshTimer=window.WW9PerfScheduler.every('fire-layers-refresh',5*60*1000,function(){return refresh(true)},{visibleOnly:true,when:activeAny,noOverlap:true});
+    ngfsRefreshTimer=window.WW9PerfScheduler.every('ngfs-refresh',NGFS_REFRESH_INTERVAL_MS,function(){pruneNgfsStaleData();return refreshNgfsOnly()},{visibleOnly:true,when:function(){return !!(ui.ngfs&&ui.ngfs.checked)},noOverlap:true});
 
     updateHistoricLabel();
     updateOpacityReadout();
@@ -52464,7 +52601,7 @@ body.ww9-radar-inspect-active .leaflet-container,body.ww9-radar-inspect-active .
     state.volumeRoot=volumeRoot;
 
     rebuildFrame();
-    animate();
+    start3dAnimation();
   }
 
   function clearSceneObjectByName(name){
@@ -52634,12 +52771,10 @@ body.ww9-radar-inspect-active .leaflet-container,body.ww9-radar-inspect-active .
     state.pointCount=0;
   }
 
-  let ww9Last3dFrame=0;
+  let ww9Last3dFrame=0,ww93dAnimationRunning=false;
+  function start3dAnimation(){if(ww93dAnimationRunning||document.hidden||panel.hidden)return;ww93dAnimationRunning=true;requestAnimationFrame(animate)}
   function animate(){
-    if(document.hidden||panel.hidden){
-      setTimeout(animate,240);
-      return;
-    }
+    if(document.hidden||panel.hidden){ww93dAnimationRunning=false;return;}
     requestAnimationFrame(animate);
     const now=performance.now();
     if(window.WW9_LOW_POWER&&now-ww9Last3dFrame<30)return;
@@ -54069,7 +54204,7 @@ body.ww9-radar-inspect-active .leaflet-container,body.ww9-radar-inspect-active .
   }
 
   btn.addEventListener('click',function(){
-    panel.hidden=false;
+    panel.hidden=false;start3dAnimation();
     if(state.areaBounds){
       showAreaRect();
       loadAndRender(false);
@@ -54086,6 +54221,7 @@ body.ww9-radar-inspect-active .leaflet-container,body.ww9-radar-inspect-active .
     map.on('mousemove',onMapMouseMove);
     map.on('mouseup',onMapMouseUp);
   }
+  document.addEventListener('visibilitychange',function(){if(!document.hidden&&!panel.hidden)start3dAnimation()},{passive:true});
   window.addEventListener('keydown',function(ev){
     if(!ev||ev.key!=='Escape')return;
     if(state.boxDrawing){
@@ -55181,9 +55317,7 @@ body.ww9-radar-inspect-active .leaflet-container,body.ww9-radar-inspect-active .
   // enabled state made this heavy overlay appear to turn itself on randomly.
   active=false;try{localStorage.removeItem(STORAGE_KEY)}catch(e){}
 
-  refreshTimer=setInterval(()=>{
-    if(active&&document.visibilityState!=='hidden')refresh().catch(()=>{});
-  },REFRESH_MS);
+  refreshTimer=window.WW9PerfScheduler.every('surface-fronts-refresh',REFRESH_MS,refresh,{visibleOnly:true,when:function(){return active},noOverlap:true});
   document.addEventListener('visibilitychange',()=>{
     if(active&&document.visibilityState==='visible')refresh().catch(()=>{});
   });
@@ -56066,12 +56200,12 @@ body.ww9-radar-inspect-active .leaflet-container,body.ww9-radar-inspect-active .
 
   // There is intentionally NO moveend/zoomend network hook. Leaflet only redraws
   // local canvases from the same fixed national data field.
-  map.on('mousemove',onMouseMove);
-  try{map.getContainer().addEventListener('mouseleave',onMouseOut)}catch(e){}
+  let aqHoverRaf=0,aqHoverEvent=null;
+  function queueAqHover(e){aqHoverEvent=e;if(aqHoverRaf)return;aqHoverRaf=requestAnimationFrame(function(){aqHoverRaf=0;const ev=aqHoverEvent;aqHoverEvent=null;onMouseMove(ev)})}
+  map.on('mousemove',queueAqHover);
+  try{map.getContainer().addEventListener('mouseleave',function(){if(aqHoverRaf){cancelAnimationFrame(aqHoverRaf);aqHoverRaf=0}aqHoverEvent=null;onMouseOut()},{passive:true})}catch(e){}
 
-  refreshTimer=setInterval(function(){
-    if(active&&document.visibilityState!=='hidden')loadNationwide(false);
-  },REFRESH_MS);
+  refreshTimer=window.WW9PerfScheduler.every('air-quality-refresh',REFRESH_MS,function(){return loadNationwide(false)},{visibleOnly:true,when:function(){return active},noOverlap:true});
 
   document.addEventListener('visibilitychange',function(){
     if(active&&document.visibilityState==='visible'){
@@ -56795,7 +56929,7 @@ function buildHub(){
 function openHub(){buildHub();hub.hidden=false;syncButtons();try{window.dispatchEvent(new CustomEvent('ww9-weather-data-hub-change',{detail:{open:true,field:currentBaseId||null}}))}catch(e){}}
 function installMenu(){let b=document.getElementById('ww9WarningWeatherData');if(!b)return false;if(!b.__ww9WeatherHubBound){b.__ww9WeatherHubBound=true;b.addEventListener('click',function(e){e.preventDefault();e.stopPropagation();openHub()})}return true}
 function boot(){if(!mapReady())return false;ensurePane('ww9WeatherDataPane',12320,false);ensurePane('ww9WeatherOverlayPane',12520,false);ensurePane('ww9RiverGaugePane',12560,true);buildHub();installMenu();if(!map.__ww9WeatherHubZoomBound){map.__ww9WeatherHubZoomBound=true;map.on('zoomend',syncButtons)}window.WW9WeatherDataHub={refreshUnits:function(){try{updateLegend(currentBaseDescriptor)}catch(e){}},open:openHub,close:()=>{if(hub)hub.hidden=true;try{window.dispatchEvent(new CustomEvent('ww9-weather-data-hub-change',{detail:{open:false,field:currentBaseId||null}}))}catch(e){}},setField:setBase,clearField:clearAllWeatherData,toggleOverlay:toggleOverlay,inspectAt:inspectAt,baseFields:BASE,overlays:OVER,get open(){return !!(hub&&!hub.hidden)},get activeField(){return currentBaseId||''},get activeDescriptor(){return currentBaseDescriptor||null}};return true}
-let tries=0,t=setInterval(()=>{tries++;if(boot()||tries>80)clearInterval(t)},250);if(document.readyState!=='loading')setTimeout(boot,0);else document.addEventListener('DOMContentLoaded',()=>setTimeout(boot,0),{once:true});
+window.WW9PerfScheduler.retry('weather-data-hub',250,81,boot);if(document.readyState!=='loading')setTimeout(boot,0);else document.addEventListener('DOMContentLoaded',()=>setTimeout(boot,0),{once:true});
 })();
 </script>
 <style id="ww9DualPaneViewStyle">
@@ -57140,7 +57274,7 @@ body.ww9-dual-pane-parent:not(.ww9-radar-app-mode) #ww9DualPane2Floating{
       const next=eventView(map,event);
       if(event&&event.type==='zoomanim')pendingView=next;
       else if(!pendingView)pendingView=next;
-      const minGap=window.WW9_LOW_POWER?30:0;
+      const minGap=window.WW9_LOW_POWER?33:16;
       const wait=minGap-(performance.now()-viewLastSentAt);
       if(wait>0){
         if(!viewDelayTimer)viewDelayTimer=setTimeout(function(){viewDelayTimer=0;sendViewSoon(null);},Math.ceil(wait));
@@ -57307,7 +57441,7 @@ body.ww9-dual-pane-parent:not(.ww9-radar-app-mode) #ww9DualPane2Floating{
     const next=eventView(map,event);
     if(event&&event.type==='zoomanim')parentPendingView=next;
     else if(!parentPendingView)parentPendingView=next;
-    const minGap=window.WW9_LOW_POWER?30:0;
+    const minGap=window.WW9_LOW_POWER?33:16;
     const wait=minGap-(performance.now()-parentViewLastSentAt);
     if(wait>0){
       if(!parentViewDelayTimer)parentViewDelayTimer=setTimeout(function(){parentViewDelayTimer=0;sendParentViewSoon(null);},Math.ceil(wait));
@@ -57693,7 +57827,7 @@ body.ww9-dual-pane-parent:not(.ww9-radar-app-mode) #ww9DualPane2Floating{
     window.WW9LowPower={enabled:!!window.WW9_LOW_POWER,device:window.WW9DeviceProfile||{},retune:function(){try{map.eachLayer(tune);}catch(e){}}};
     return true;
   }
-  var tries=0,t=setInterval(function(){tries++;if(install()||tries>60)clearInterval(t);},250);
+  window.WW9PerfScheduler.retry('phase-install-250',250,61,install);
   if(document.readyState!=='loading')setTimeout(install,0);else document.addEventListener('DOMContentLoaded',function(){setTimeout(install,0);},{once:true});
 })();
 </script>
@@ -57750,7 +57884,7 @@ body.ww9-dual-pane-parent:not(.ww9-radar-app-mode) #ww9DualPane2Floating{
     setTimeout(applyFitMinZoom,60);
     return true;
   }
-  let tries=0,t=setInterval(function(){tries++;if(install()||tries>80)clearInterval(t);},100);
+  window.WW9PerfScheduler.retry('phase-install-100',100,81,install);
   if(document.readyState!=='loading')setTimeout(install,0);
   else document.addEventListener('DOMContentLoaded',function(){setTimeout(install,0);},{once:true});
 })();
@@ -57997,22 +58131,26 @@ function queryVisibleCount(){
   try{return ALL_IDS.reduce((n,id)=>n+(m.getLayer(id)?m.queryRenderedFeatures(undefined,{layers:[id]}).length:0),0)}catch(e){return 0}
 }
 function sync(){
-  if(!install())return false;
-  registerOrder();theme();setVisible(toggleOn());
+  const m=gl();if(!m||!m.isStyleLoaded||!m.isStyleLoaded())return false;
+  const missing=!m.getSource(SOURCE)||LAYERS.some(d=>!m.getLayer(d.id));
+  if(missing)return install();
+  theme();setVisible(toggleOn());
   return true;
 }
 function boot(){
   let tries=0;
-  const timer=setInterval(()=>{tries++;if(sync()||tries>180)clearInterval(timer)},100);
+  window.WW9PerfScheduler.retry('native-cities-sync',100,181,function(){tries++;return sync()});
   ['citiesToggle','themeToggle','satelliteToggle'].forEach(id=>{
     const el=document.getElementById(id);if(!el||el.__ww9City31)return;
     el.__ww9City31=true;el.addEventListener('change',()=>setTimeout(sync,0));
   });
-  let mt=0,mi=setInterval(()=>{mt++;const m=gl();if(m){clearInterval(mi);try{
-    m.on('styledata',()=>setTimeout(sync,40));
+  window.WW9PerfScheduler.retry('native-cities-style-hook',100,181,function(){const m=gl();if(!m)return false;try{
+    // Only a full style replacement needs reconstruction. Ordinary paint/layout
+    // changes fire styledata and must not recursively call sync().
+    m.on('style.load',()=>setTimeout(sync,80));
     m.on('sourcedata',e=>{if(e&&e.sourceId===SOURCE&&e.isSourceLoaded){loadedTileEvents++;lastDataAt=Date.now()}});
     m.on('error',e=>{try{if(e&&e.sourceId===SOURCE)lastError=String(e.error&&e.error.message||e.error||'city vector source error')}catch(_e){}});
-  }catch(e){}}else if(mt>180)clearInterval(mi)},100);
+  }catch(e){}return true});
 }
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',boot,{once:true});else boot();
 
@@ -58172,8 +58310,9 @@ async function queryWorldCities(env,minPop){
   return Array.isArray(data&&data.features)?data.features:[];
 }
 async function refreshGlobalCities(){
-  // Obsolete in Phase32. MapLibre/OpenFreeMap loads settlement tiles natively.
-  try{window.WW9NativeCitiesV31&&window.WW9NativeCitiesV31.refresh&&window.WW9NativeCitiesV31.refresh()}catch(e){}
+  // Phase 39: native vector tiles follow the camera automatically. No restyle on
+  // every pan/zoom is required.
+  return true;
 }
 function scheduleCities(delay){clearTimeout(globalCityTimer);globalCityTimer=setTimeout(refreshGlobalCities,delay==null?80:delay)}
 
@@ -58185,9 +58324,9 @@ function wrapRtma(){
   return true;
 }
 function boot(){
-  let tries=0,t=setInterval(()=>{tries++;const cities=installGlobalCities(),rt=wrapRtma();if(cities)scheduleCities(40);if((cities&&rt)||tries>160)clearInterval(t)},100);
+  window.WW9PerfScheduler.retry('global-cities-rtma',100,161,function(){tries++;const cities=installGlobalCities(),rt=wrapRtma();if(cities)scheduleCities(40);return !!(cities&&rt)});
   const ct=document.getElementById('citiesToggle');if(ct)ct.addEventListener('change',()=>{syncGlobalCities();if(ct.checked)scheduleCities(20)});
-  let mapTries=0,mt=setInterval(()=>{mapTries++;const m=gl();if(m){m.on('moveend',()=>scheduleCities(160));m.on('zoomend',()=>scheduleCities(80));clearInterval(mt)}else if(mapTries>160)clearInterval(mt)},100);
+  // Native OpenMapTiles handles viewport changes; no move/zoom refresh hooks.
 }
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',boot,{once:true});else boot();
 
@@ -58229,17 +58368,12 @@ const US_DOTS=['ww9-city-dot-major','ww9-city-dot-large','ww9-city-dot-medium','
 const GLOBAL_LABELS=['ww9-global-city-major','ww9-global-city-large','ww9-global-city-medium','ww9-global-city-small'];
 const GLOBAL_DOTS=['ww9-global-city-dot-major','ww9-global-city-dot-large','ww9-global-city-dot-medium','ww9-global-city-dot-small'];
 function adapter(){return window.WW9Map||window.map||null}function gl(){const a=adapter();return a&&a._maplibre||null}
-function applyCityPriority(){
-  // Phase32: there is only one visible settlement hierarchy. Let the native
-  // OpenMapTiles renderer own ranking/collision; do not restyle legacy sources.
-  try{window.WW9NativeCitiesV31&&window.WW9NativeCitiesV31.refresh&&window.WW9NativeCitiesV31.refresh()}catch(e){}
-  return true;
-}
-function pitchGuard(){const m=gl();if(!m)return;const pitch=Number(m.getPitch())||0,high=pitch>60.5,container=m.getContainer();container&&container.classList.toggle('ww9-phase11-high-pitch',high);container&&container.classList.toggle('ww9-phase12-high-pitch',pitch>57.5);try{m.setRenderWorldCopies(!high)}catch(e){}
+function applyCityPriority(){return true}
+function pitchGuard(){const m=gl();if(!m)return;const pitch=Number(m.getPitch())||0,high=pitch>60.5,container=m.getContainer();container&&container.classList.toggle('ww9-phase11-high-pitch',high);container&&container.classList.toggle('ww9-phase12-high-pitch',pitch>57.5);try{m.setRenderWorldCopies(window.WW9_LOW_POWER?false:!high)}catch(e){}
   if(high){try{container.querySelectorAll('.ww9-world-mirror,.ww9-zoom-handoff-snapshot').forEach(n=>{n.style.display='none'})}catch(e){}}
 }
 function kickCanvasSources(){const m=gl();if(!m||!m.getStyle)return;try{const style=m.getStyle(),sources=style&&style.sources||{};Object.keys(sources).forEach(id=>{const src=m.getSource(id);if(sources[id]&&sources[id].type==='canvas'&&src&&src.play){src.play();setTimeout(()=>{try{src.pause&&src.pause()}catch(e){}},320)}});m.triggerRepaint&&m.triggerRepaint()}catch(e){}}
-function boot(){let n=0,t=setInterval(()=>{n++;const m=gl();if(m&&m.isStyleLoaded&&m.isStyleLoaded()){clearInterval(t);applyCityPriority();pitchGuard();kickCanvasSources();m.on('pitch',pitchGuard);m.on('styledata',()=>{setTimeout(()=>{applyCityPriority();pitchGuard()},30)});m.on('idle',()=>{if(!window.__ww9Phase11IdleKick){window.__ww9Phase11IdleKick=true;kickCanvasSources();setTimeout(()=>{window.__ww9Phase11IdleKick=false},1200)}})}else if(n>180)clearInterval(t)},100)}
+function boot(){window.WW9PerfScheduler.retry('phase11-map-ready',100,181,function(){const m=gl();if(m&&m.isStyleLoaded&&m.isStyleLoaded()){pitchGuard();kickCanvasSources();m.on('pitch',pitchGuard);return true}return false})}
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',boot,{once:true});else boot();
 window.WW9Phase11Diagnostics={
   get pitch(){const m=gl();return m?{pitch:m.getPitch(),worldCopies:m.getRenderWorldCopies?m.getRenderWorldCopies():null,highPitchClass:m.getContainer().classList.contains('ww9-phase11-high-pitch')}:null},
@@ -58270,7 +58404,7 @@ function purgeSkyMarkers(){
   const m=gl();if(!m)return;const high=(Number(m.getPitch())||0)>57.5,c=m.getContainer();c&&c.classList.toggle('ww9-phase12-high-pitch',high);
   if(high)try{m.setRenderWorldCopies(false)}catch(e){}
 }
-function boot(){let n=0,t=setInterval(()=>{n++;const m=gl();if(m&&m.isStyleLoaded&&m.isStyleLoaded()){clearInterval(t);purgeSkyMarkers();m.on('pitch',purgeSkyMarkers);m.on('styledata',()=>setTimeout(fixFrontLayers,80));}else if(n>180)clearInterval(t)},100)}
+function boot(){window.WW9PerfScheduler.retry('phase12-map-ready',100,181,function(){const m=gl();if(m&&m.isStyleLoaded&&m.isStyleLoaded()){purgeSkyMarkers();m.on('pitch',purgeSkyMarkers);m.on('style.load',()=>setTimeout(fixFrontLayers,120));return true}return false})}
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',boot,{once:true});else boot();
 window.WW9Phase12Diagnostics={
   get cities(){try{return window.WW9NativeCitiesV31?window.WW9NativeCitiesV31.diagnostics():{renderer:'vector tiles pending'}}catch(e){return {error:String(e)}}},
@@ -58379,7 +58513,7 @@ function syncVectorCities(){
   try{window.WW9NativeCitiesV31&&window.WW9NativeCitiesV31.refresh&&window.WW9NativeCitiesV31.refresh()}catch(e){}
 }
 function bootVectorCities(){
-  let n=0,t=setInterval(()=>{n++;const m=gl();if(m&&m.isStyleLoaded&&m.isStyleLoaded()){clearInterval(t);syncVectorCities();try{m.on('styledata',()=>setTimeout(syncVectorCities,40))}catch(e){}}else if(n>180)clearInterval(t)},100);
+  window.WW9PerfScheduler.retry('vector-cities-map-ready',100,181,function(){const m=gl();if(m&&m.isStyleLoaded&&m.isStyleLoaded()){syncVectorCities();try{m.on('style.load',()=>setTimeout(syncVectorCities,100))}catch(e){}return true}return false});
 }
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',bootVectorCities,{once:true});else bootVectorCities();
 
@@ -58400,26 +58534,8 @@ window.WW9Phase13Diagnostics={
 </style>
 <script id="ww9MapLibrePhase14CoreFixes">
 (function(){
-'use strict';if(window.__ww9MapLibrePhase14CoreFixes)return;window.__ww9MapLibrePhase14CoreFixes=true;
-const SAT_SRC='ww9-phase14-satellite-source',SAT_LAYER='ww9-phase14-satellite-layer';
-function adapter(){return window.WW9Map||window.map||null}function gl(){const a=adapter();return a&&a._maplibre||null}
-function installSatelliteBase(){const m=gl();if(!m||!m.isStyleLoaded||!m.isStyleLoaded())return false;try{
-  if(!m.getSource(SAT_SRC))m.addSource(SAT_SRC,{type:'raster',tiles:['https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'],tileSize:256,minzoom:0,maxzoom:23});
-  if(!m.getLayer(SAT_LAYER)){
-    const layers=(m.getStyle().layers||[]),before=layers.find(l=>{try{const s=m.getSource(l.source),d=m.getStyle().sources&&m.getStyle().sources[l.source],tiles=d&&d.tiles;return Array.isArray(tiles)&&tiles.some(u=>/World_Transportation/i.test(String(u)))}catch(e){return false}});
-    m.addLayer({id:SAT_LAYER,type:'raster',source:SAT_SRC,minzoom:0,maxzoom:24,paint:{'raster-opacity':1,'raster-resampling':'linear','raster-fade-duration':0}},before&&before.id);
-  }
-  const toggle=document.getElementById('satelliteToggle'),on=!!(toggle&&toggle.checked);m.setLayoutProperty(SAT_LAYER,'visibility',on?'visible':'none');if(on){try{m.setPaintProperty(SAT_LAYER,'raster-opacity',1)}catch(e){}}
-  return true;
-}catch(e){console.warn('WW9 Phase14 satellite basemap install failed',e);return false}}
-function bind(){let n=0,t=setInterval(()=>{n++;const m=gl();if(m&&m.isStyleLoaded&&m.isStyleLoaded()){clearInterval(t);installSatelliteBase();const tog=document.getElementById('satelliteToggle');if(tog)tog.addEventListener('change',()=>setTimeout(installSatelliteBase,0));m.on('styledata',()=>setTimeout(installSatelliteBase,40));}else if(n>180)clearInterval(t)},100)}
-if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',bind,{once:true});else bind();
-window.WW9Phase14Diagnostics={
- get satellite(){const m=gl();return {toggle:!!document.getElementById('satelliteToggle')?.checked,nativeSource:!!(m&&m.getSource(SAT_SRC)),nativeLayer:!!(m&&m.getLayer(SAT_LAYER)),visibility:m&&m.getLayer(SAT_LAYER)?m.getLayoutProperty(SAT_LAYER,'visibility'):null,nowCoastWms:'sat_meteo_imagery_time numeric layers 1/5/9'}},
- get rtma(){try{return window.WW9RtmaAnalysisEngine&&window.WW9RtmaAnalysisEngine.diagnostics?window.WW9RtmaAnalysisEngine.diagnostics():{source:window.WW9RtmaAnalysisEngine&&window.WW9RtmaAnalysisEngine.source,grid:window.WW9RtmaAnalysisEngine&&window.WW9RtmaAnalysisEngine.grid}}catch(e){return {error:String(e)}}},
- get radar3d(){try{return Object.assign(window.WW93dRadarVolume&&window.WW93dRadarVolume.state?window.WW93dRadarVolume.state():{}, {physicalRenderer:'smooth Volume + ISO hybrid; raymarched 3D texture + marching-cubes shells from the same reconstructed field'})}catch(e){return {error:String(e)}}},
- get crossSection(){try{return Object.assign(window.WW9RadarCrossSection&&window.WW9RadarCrossSection.state?window.WW9RadarCrossSection.state():{}, {renderer:'strict beam-footprint cross section; limited gap interpolation'})}catch(e){return {error:String(e)}}}
-};
+'use strict';window.__ww9MapLibrePhase14CoreFixes=true;window.__ww9Phase14SupersededByPhase15=true;
+window.WW9Phase14Diagnostics={satellite:{supersededBy:'Phase15'},rtma:null,radar3d:null,crossSection:null};
 })();
 </script>
 
@@ -58464,7 +58580,7 @@ function install(){const g=gl();if(!g)return false;ensure();
   const draw=document.getElementById('ww93dVolumeDrawBox'),close3=document.getElementById('ww93dVolumeClose');draw&&draw.addEventListener('click',()=>{boxStart=null;setBox(null,null)});close3&&close3.addEventListener('click',()=>{boxStart=null;setBox(null,null)});
   const sm=document.getElementById('ww9CrossSectionInterpolate'),lab=document.getElementById('ww9CrossSectionInterpLabel');if(lab){lab.lastChild&&(lab.lastChild.textContent=' Interpolate');lab.title='Off = native beam/gate sampling; On = old-style linear interpolation between adjacent tilts (no Gaussian or horizontal smoothing)';}if(sm){try{const saved=localStorage.getItem('ww9_xsec_interpolate');sm.checked=saved==null?true:saved==='1'}catch(e){sm.checked=true}sm.addEventListener('change',()=>{try{localStorage.setItem('ww9_xsec_interpolate',sm.checked?'1':'0')}catch(e){}})}
   return true}
-let n=0,t=setInterval(()=>{if(install()||++n>100)clearInterval(t)},100);
+window.WW9PerfScheduler.retry('phase16-install',100,101,install);
 window.WW9Phase16Diagnostics={crossSectionRenderer:'v1.17-direct-pixel-linear-intertilt',physical3dTopOverlay:true,radarLoopExport:'1920x1080-webm-map-canvas-only'};
 window.WW9Phase15CurrentIssueDiagnostics={get native(){const g=gl();return{box:!!g?.getLayer(BOX_LINE),crossLine:!!g?.getLayer(X_LINE),physical3d:!!g?.getLayer('ww9-3d-radar-physical-volume'),physical3dError:window.__ww9Physical3dLastError||null,physical3dFrames:window.__ww9Physical3dFrames||0,physical3dPayload:!!(window.WW93dRadarVolume&&document.getElementById('ww93dVolumePanel')&&!document.getElementById('ww93dVolumePanel').hidden)}},get interpolation(){return !!document.getElementById('ww9CrossSectionInterpolate')?.checked}};
 })();
@@ -58627,7 +58743,7 @@ async function install(){const m=gl();if(!m||!m.isStyleLoaded||!m.isStyleLoaded(
   if(!m.getLayer(LAYER)){m.addLayer({id:LAYER,type:'symbol',source:SOURCE,minzoom:0,maxzoom:24,layout:{'text-field':['get','name'],'text-size':['interpolate',['linear'],['zoom'],0,9.5,4,11,8,12.5],'text-font':['Noto Sans Regular'],'text-transform':'uppercase','text-letter-spacing':.08,'text-allow-overlap':false,'text-ignore-placement':false,'text-padding':4,'text-rotation-alignment':'viewport','text-pitch-alignment':'viewport'},paint:{'text-color':'rgba(235,241,246,.88)','text-halo-color':'rgba(0,0,0,.82)','text-halo-width':1.7}});try{adapter()._registerNativeLayer(LAYER,555)}catch(e){}}
   setVisible(wanted());lastError=null;return true;
 }catch(e){lastError=String(e&&e.message||e);console.warn('WW9 country label install failed',e);return false}}
-function boot(){let n=0,t=setInterval(async()=>{n++;if(await install()||n>120)clearInterval(t)},150);const el=document.getElementById('countryNamesToggle');if(el)el.addEventListener('change',()=>setVisible(wanted()));}
+function boot(){window.WW9PerfScheduler.retry('country-labels',150,121,install);const el=document.getElementById('countryNamesToggle');if(el)el.addEventListener('change',()=>setVisible(wanted()));}
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',boot,{once:true});else boot();
 window.WW9NativeCountryLabelsV24={install,setVisible,diagnostics:()=>({count,lastError,visible:wanted(),source:!!(gl()&&gl().getSource(SOURCE))})};
 })();
@@ -58650,7 +58766,7 @@ function resync(reason){
   return true;
 }
 function boot(){
-  let n=0,t=setInterval(()=>{n++;const m=gl();if(m&&m.isStyleLoaded&&m.isStyleLoaded()){clearInterval(t);resync('boot');}else if(n>180)clearInterval(t)},100);
+  window.WW9PerfScheduler.retry('map-resync-ready',100,181,function(){const m=gl();if(m&&m.isStyleLoaded&&m.isStyleLoaded()){resync('boot');return true}return false});
   // Resize only the camera surface. Do not rebuild/reorder the entire style.
   let resizeRaf=0;
   window.addEventListener('resize',()=>{if(resizeRaf)cancelAnimationFrame(resizeRaf);resizeRaf=requestAnimationFrame(()=>{resizeRaf=0;try{const m=gl();m&&m.resize&&m.resize()}catch(e){}})},{passive:true});
@@ -58713,258 +58829,64 @@ window.WW9Phase37Diagnostics={viirsRenderer:'single-native-maplibre-geojson-laye
 </script>
 <script id="ww9Phase38FinalDiagnostics">(function(){window.WW9Phase38Diagnostics={rtmaProbeStrictModeFix:true,nwsProbe:'alerts-active-count',autosaveHardened:true,systemCheckLocation:'App Settings bottom'};})();</script>
 
-<script id="ww9VectorCloseRoadsV1">
+<script id="ww9VectorCloseRoadsV2">
 (function(){
 'use strict';
-if(window.__ww9VectorCloseRoadsV1)return;
-window.__ww9VectorCloseRoadsV1=true;
-
-// World_Transportation deliberately becomes label-heavy at street scales.
-// Keep it for regional cartography, then hand close-range road geometry to
-// the same OpenFreeMap/OpenMapTiles vector source WW9 already uses for cities.
-const SOURCE='ww9-city-places-v31';
-const SOURCE_URL='https://tiles.openfreemap.org/planet';
-const SOURCE_ATTR='OpenFreeMap © OpenMapTiles Data from OpenStreetMap';
-const ROAD_SOURCE_LAYER='transportation';
-const NAME_SOURCE_LAYER='transportation_name';
-const PREFIX='ww9-close-road-v1-';
-const LABEL_ID=PREFIX+'names';
-const ROAD_CLASSES=[
-  {cls:'track',     min:15.5, w:[.45,1.1,4.0],  dark:'#626861', light:'#777a73'},
-  {cls:'service',   min:15.0, w:[.55,1.5,5.2],  dark:'#6d7370', light:'#777b78'},
-  {cls:'minor',     min:14.0, w:[.8, 2.2,7.2],  dark:'#85867d', light:'#696f6d'},
-  {cls:'tertiary',  min:13.5, w:[1.0,3.0,9.0],  dark:'#a99d76', light:'#7b7359'},
-  {cls:'secondary', min:13.0, w:[1.2,3.8,11.0], dark:'#c0a875', light:'#8b7652'},
-  {cls:'primary',   min:12.5, w:[1.45,4.8,13.0],dark:'#d2b06f', light:'#956f48'},
-  {cls:'trunk',     min:12.0, w:[1.7,5.8,15.5], dark:'#dda06a', light:'#a66749'},
-  {cls:'motorway',  min:11.5, w:[1.9,6.8,18.0], dark:'#e28a67', light:'#ad5d48'}
-];
-const ROAD_IDS=[];
-ROAD_CLASSES.forEach(d=>{ROAD_IDS.push(PREFIX+d.cls+'-case',PREFIX+d.cls+'-line')});
-const ALL_IDS=ROAD_IDS.concat([LABEL_ID]);
-let lastError=null,lastInstall=0,lastData=0;
-
-function adapter(){return window.WW9Map||window.map||null}
-function gl(){const a=adapter();return a&&a._maplibre||null}
+if(window.__ww9VectorCloseRoadsV2)return;window.__ww9VectorCloseRoadsV2=true;
+const SOURCE='ww9-city-places-v31',SOURCE_URL='https://tiles.openfreemap.org/planet';
+const ROAD='ww9-close-road-v2-line',CASE='ww9-close-road-v2-case',NAMES='ww9-close-road-v2-names';
+const LOW=!!window.WW9_LOW_POWER;
+const CLASSES=LOW?['motorway','trunk','primary','secondary','tertiary','minor']:['motorway','trunk','primary','secondary','tertiary','minor','service','track'];
+let legacyCapped=false,lastError=null,lastInstall=0;
+function adapter(){return window.WW9Map||window.map||null}function gl(){const a=adapter();return a&&a._maplibre||null}
 function roadsOn(){const t=document.getElementById('roadsToggle');return !t||!!t.checked}
-function isLight(){const t=document.getElementById('themeToggle');return !!(t&&t.checked)&&!isSat()}
-function isSat(){const t=document.getElementById('satelliteToggle');return !!(t&&t.checked)}
-function roadPaneZ(){try{const a=adapter(),p=a&&a.getPane&&a.getPane('roadsPane');const z=Number(p&&p.style&&p.style.zIndex);return Number.isFinite(z)?z:310}catch(e){return 310}}
-function widthExpr(d,extra){
-  const add=Number(extra)||0;
-  return ['interpolate',['exponential',1.35],['zoom'],
-    d.min,Math.max(.25,d.w[0]+add),
-    17,Math.max(.4,d.w[1]+add),
-    24,Math.max(.8,d.w[2]+add)
-  ];
-}
-function filterFor(cls){return ['==',['get','class'],cls]}
-function textField(){return ['coalesce',['get','name:en'],['get','name_en'],['get','name'],['get','ref'],'']}
-function addRoadLayers(m,d){
-  const caseId=PREFIX+d.cls+'-case',lineId=PREFIX+d.cls+'-line';
-  if(!m.getLayer(caseId))m.addLayer({
-    id:caseId,type:'line',source:SOURCE,'source-layer':ROAD_SOURCE_LAYER,
-    minzoom:d.min,maxzoom:24,filter:filterFor(d.cls),
-    layout:{'line-cap':'round','line-join':'round','visibility':roadsOn()?'visible':'none'},
-    paint:{'line-color':'rgba(3,7,10,.84)','line-opacity':.96,'line-width':widthExpr(d,d.cls==='motorway'||d.cls==='trunk'?2.2:1.5)}
-  });
-  if(!m.getLayer(lineId))m.addLayer({
-    id:lineId,type:'line',source:SOURCE,'source-layer':ROAD_SOURCE_LAYER,
-    minzoom:d.min,maxzoom:24,filter:filterFor(d.cls),
-    layout:{'line-cap':'round','line-join':'round','visibility':roadsOn()?'visible':'none'},
-    paint:{'line-color':d.dark,'line-opacity':d.cls==='track'?.6:(d.cls==='service'?.78:.96),'line-width':widthExpr(d,0)}
-  });
-}
-function addNameLayer(m){
-  if(m.getLayer(LABEL_ID))return;
-  m.addLayer({
-    id:LABEL_ID,type:'symbol',source:SOURCE,'source-layer':NAME_SOURCE_LAYER,
-    minzoom:15.25,maxzoom:24,
-    filter:['match',['get','class'],['motorway','trunk','primary','secondary','tertiary','minor','service'],true,false],
-    layout:{
-      'symbol-placement':'line',
-      'text-field':textField(),
-      'text-font':['Noto Sans Regular'],
-      'text-size':['interpolate',['linear'],['zoom'],15.25,9.4,18,10.7,22,12.1,24,12.8],
-      'text-letter-spacing':.01,
-      'text-max-angle':38,
-      'text-padding':2.2,
-      'text-keep-upright':true,
-      'text-allow-overlap':false,
-      'text-ignore-placement':false,
-      'text-rotation-alignment':'map',
-      'text-pitch-alignment':'map',
-      'visibility':roadsOn()?'visible':'none'
-    },
-    paint:{'text-color':'#b9ad83','text-halo-color':'rgba(4,8,12,.96)','text-halo-width':1.55,'text-halo-blur':0}
-  });
-}
-function applyTheme(){
-  const m=gl();if(!m)return;
-  const light=isLight(),sat=isSat();
-  ROAD_CLASSES.forEach(d=>{
-    const lineId=PREFIX+d.cls+'-line',caseId=PREFIX+d.cls+'-case';
-    if(m.getLayer(lineId))try{m.setPaintProperty(lineId,'line-color',light?d.light:d.dark)}catch(e){}
-    if(m.getLayer(caseId))try{m.setPaintProperty(caseId,'line-color',light?'rgba(255,255,255,.82)':(sat?'rgba(0,0,0,.92)':'rgba(3,7,10,.84)'))}catch(e){}
-  });
-  if(m.getLayer(LABEL_ID))try{
-    m.setPaintProperty(LABEL_ID,'text-color',light?'#5d5648':'#b9ad83');
-    m.setPaintProperty(LABEL_ID,'text-halo-color',light?'rgba(255,255,255,.94)':'rgba(4,8,12,.96)');
+function sat(){const t=document.getElementById('satelliteToggle');return !!(t&&t.checked)}function light(){const t=document.getElementById('themeToggle');return !!(t&&t.checked)&&!sat()}
+function filter(){return ['match',['get','class'],['literal',CLASSES],true,false]}
+function classWidth(scale){return ['match',['get','class'],'motorway',1.9*scale,'trunk',1.7*scale,'primary',1.45*scale,'secondary',1.2*scale,'tertiary',1.0*scale,'minor',.8*scale,'service',.55*scale,'track',.45*scale,.7*scale]}
+function width(extra){return ['interpolate',['exponential',1.3],['zoom'],12,['+',classWidth(.75),extra],17,['+',classWidth(2.0),extra],24,['+',classWidth(5.2),extra]]}
+function color(){return ['match',['get','class'],'motorway','#e28a67','trunk','#dda06a','primary','#d2b06f','secondary','#c0a875','tertiary','#a99d76','minor','#85867d','service','#6d7370','track','#626861','#85867d']}
+function order(){try{const a=adapter(),p=a&&a.getPane&&a.getPane('roadsPane'),z=Number(p&&p.style&&p.style.zIndex)||310;if(a&&a._registerNativeLayer){a._registerNativeLayer(CASE,z+2.5);a._registerNativeLayer(ROAD,z+2.51);if(!LOW)a._registerNativeLayer(NAMES,z+2.52)}}catch(e){}}
+function capLegacy(m){if(legacyCapped)return;legacyCapped=true;try{const st=m.getStyle(),sources=st&&st.sources||{};(st.layers||[]).forEach(l=>{if(!l.source)return;const u=sources[l.source]&&sources[l.source].tiles;if(Array.isArray(u)&&u.some(x=>/Reference\/World_Transportation\/MapServer/i.test(String(x)))){try{m.setLayerZoomRange(l.id,l.minzoom==null?0:l.minzoom,16.500001)}catch(e){}}})}catch(e){}}
+function install(){const m=gl();if(!m||!m.isStyleLoaded||!m.isStyleLoaded())return false;try{
+ if(!m.getSource(SOURCE))m.addSource(SOURCE,{type:'vector',url:SOURCE_URL,attribution:'OpenFreeMap © OpenMapTiles Data from OpenStreetMap'});
+ if(!m.getLayer(CASE))m.addLayer({id:CASE,type:'line',source:SOURCE,'source-layer':'transportation',minzoom:12,maxzoom:24,filter:filter(),layout:{'line-cap':'round','line-join':'round','visibility':roadsOn()?'visible':'none'},paint:{'line-color':'rgba(3,7,10,.86)','line-opacity':.94,'line-width':width(LOW?.55:1.25)}});
+ if(!m.getLayer(ROAD))m.addLayer({id:ROAD,type:'line',source:SOURCE,'source-layer':'transportation',minzoom:12,maxzoom:24,filter:filter(),layout:{'line-cap':'round','line-join':'round','visibility':roadsOn()?'visible':'none'},paint:{'line-color':color(),'line-opacity':.94,'line-width':width(0)}});
+ if(!LOW&&!m.getLayer(NAMES))m.addLayer({id:NAMES,type:'symbol',source:SOURCE,'source-layer':'transportation_name',minzoom:16,maxzoom:24,filter:['match',['get','class'],['literal',['motorway','trunk','primary','secondary','tertiary','minor']],true,false],layout:{'symbol-placement':'line','text-field':['coalesce',['get','name:en'],['get','name'],['get','ref'],''],'text-font':['Noto Sans Regular'],'text-size':['interpolate',['linear'],['zoom'],16,9.5,20,11.2,24,12.4],'text-padding':3,'text-allow-overlap':false,'text-ignore-placement':false,'text-keep-upright':true,'text-rotation-alignment':'map','text-pitch-alignment':'map','visibility':roadsOn()?'visible':'none'},paint:{'text-color':'#b9ad83','text-halo-color':'rgba(4,8,12,.96)','text-halo-width':1.4}});
+ capLegacy(m);order();lastInstall=Date.now();lastError=null;syncStyle();return true;
+ }catch(e){lastError=String(e&&e.message||e);console.warn('WW9 compact vector roads install failed',e);return false}}
+function setIf(m,id,kind,prop,val){if(!m.getLayer(id))return;try{const cur=kind==='layout'?m.getLayoutProperty(id,prop):m.getPaintProperty(id,prop);if(JSON.stringify(cur)!==JSON.stringify(val)){if(kind==='layout')m.setLayoutProperty(id,prop,val);else m.setPaintProperty(id,prop,val)}}catch(e){}}
+function syncStyle(){const m=gl();if(!m)return false;const vis=roadsOn()?'visible':'none';[CASE,ROAD,NAMES].forEach(id=>setIf(m,id,'layout','visibility',vis));setIf(m,CASE,'paint','line-color',light()?'rgba(255,255,255,.82)':(sat()?'rgba(0,0,0,.92)':'rgba(3,7,10,.86)'));if(!LOW){setIf(m,NAMES,'paint','text-color',light()?'#5d5648':'#b9ad83');setIf(m,NAMES,'paint','text-halo-color',light()?'rgba(255,255,255,.94)':'rgba(4,8,12,.96)')}return true}
+function sync(){const m=gl();if(!m||!m.getLayer(ROAD)||!m.getLayer(CASE))return install();return syncStyle()}
+function boot(){window.WW9PerfScheduler.retry('close-roads-install',100,121,install);['roadsToggle','themeToggle','satelliteToggle'].forEach(id=>{const el=document.getElementById(id);if(!el||el.__ww9CloseRoadsV2)return;el.__ww9CloseRoadsV2=true;el.addEventListener('change',()=>setTimeout(sync,0))});window.WW9PerfScheduler.retry('close-roads-map-hook',100,121,function(){const m=gl();if(!m)return false;try{m.on('style.load',()=>{legacyCapped=false;setTimeout(install,100)})}catch(e){}return true})}
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',boot,{once:true});else boot();
+window.WW9CloseRoadsV2={sync,diagnostics:()=>({lowPower:LOW,layers:[CASE,ROAD].concat(LOW?[]:[NAMES]),lastInstall:lastInstall?new Date(lastInstall).toISOString():null,lastError})};window.WW9CloseRoadsV1=window.WW9CloseRoadsV2;
+})();
+</script>
+
+<script id="ww9PerformanceArchitectureSweepV0123">
+(function(){
+  'use strict';
+  if(window.WW9PerformanceSweep)return;
+  const longTasks=[];
+  try{
+    if(typeof PerformanceObserver==='function'&&PerformanceObserver.supportedEntryTypes&&PerformanceObserver.supportedEntryTypes.includes('longtask')){
+      const po=new PerformanceObserver(list=>{for(const e of list.getEntries()){longTasks.push({at:Date.now(),duration:Math.round(e.duration*10)/10});while(longTasks.length>40)longTasks.shift()}});
+      po.observe({entryTypes:['longtask']});
+    }
   }catch(e){}
-}
-function setVisible(on){
-  const m=gl();if(!m)return false;on=typeof on==='boolean'?on:roadsOn();
-  ALL_IDS.forEach(id=>{try{if(m.getLayer(id))m.setLayoutProperty(id,'visibility',on?'visible':'none')}catch(e){}});
-  return true;
-}
-function registerOrder(){
-  const a=adapter();if(!a||!a._registerNativeLayer)return;
-  const base=roadPaneZ()+2.5;
-  ROAD_CLASSES.forEach((d,i)=>{
-    try{a._registerNativeLayer(PREFIX+d.cls+'-case',base+i*.02)}catch(e){}
-    try{a._registerNativeLayer(PREFIX+d.cls+'-line',base+i*.02+.01)}catch(e){}
-  });
-  // Road names sit just above their geometry but below WW9 city labels.
-  try{a._registerNativeLayer(LABEL_ID,base+1)}catch(e){}
-  try{a._syncLayerOrder&&a._syncLayerOrder()}catch(e){}
-}
-function install(){
-  const m=gl();if(!m||!m.isStyleLoaded||!m.isStyleLoaded())return false;
-  try{
-    if(!m.getSource(SOURCE))m.addSource(SOURCE,{type:'vector',url:SOURCE_URL,attribution:SOURCE_ATTR});
-    ROAD_CLASSES.forEach(d=>addRoadLayers(m,d));
-    addNameLayer(m);registerOrder();applyTheme();setVisible(roadsOn());
-    // Do not let the legacy Esri transportation raster dominate street scale.
-    // Its own cartography intentionally becomes label-only when zoomed in.
-    try{
-      (m.getStyle().layers||[]).forEach(l=>{
-        if(!l||!l.source)return;
-        const st=m.getStyle(),sd=st&&st.sources&&st.sources[l.source],urls=sd&&sd.tiles;
-        if(Array.isArray(urls)&&urls.some(u=>/Reference\/World_Transportation\/MapServer/i.test(String(u)))){
-          try{m.setLayerZoomRange(l.id,l.minzoom==null?0:l.minzoom,16.500001)}catch(e){}
-        }
-      });
-    }catch(e){}
-    lastInstall=Date.now();lastError=null;return true;
-  }catch(e){lastError=String(e&&e.message||e);console.warn('WW9 close-range vector roads install failed',e);return false}
-}
-function sync(){if(!install())return false;applyTheme();setVisible(roadsOn());return true}
-function boot(){
-  let tries=0,t=setInterval(()=>{tries++;if(sync()||tries>180)clearInterval(t)},100);
-  ['roadsToggle','themeToggle','satelliteToggle'].forEach(id=>{const el=document.getElementById(id);if(!el||el.__ww9CloseRoadsV1)return;el.__ww9CloseRoadsV1=true;el.addEventListener('change',()=>setTimeout(sync,0))});
-  let n=0,mt=setInterval(()=>{n++;const m=gl();if(m){clearInterval(mt);try{
-    m.on('styledata',()=>setTimeout(sync,45));
-    m.on('sourcedata',e=>{if(e&&e.sourceId===SOURCE&&e.isSourceLoaded)lastData=Date.now()});
-    m.on('error',e=>{try{if(e&&e.sourceId===SOURCE)lastError=String(e.error&&e.error.message||e.error||'vector road source error')}catch(_e){}});
-  }catch(e){}}else if(n>180)clearInterval(mt)},100);
-}
-if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',boot,{once:true});else boot();
-window.WW9CloseRoadsV1={
-  sync,setVisible,
-  diagnostics:()=>({source:SOURCE_URL,sourceLayer:ROAD_SOURCE_LAYER,nameLayer:NAME_SOURCE_LAYER,roadsEnabled:roadsOn(),installed:ALL_IDS.filter(id=>gl()&&gl().getLayer(id)).length,lastInstall:lastInstall?new Date(lastInstall).toISOString():null,lastData:lastData?new Date(lastData).toISOString():null,lastError})
-};
+  function domStats(){
+    const map=document.getElementById('map');
+    return {nodes:document.getElementsByTagName('*').length,mapChildren:map?map.getElementsByTagName('*').length:0,radarSiteButtons:document.querySelectorAll('.ww9-site-button').length,leafletMarkers:document.querySelectorAll('.leaflet-marker-icon').length};
+  }
+  window.WW9PerformanceSweep={
+    version:'0.1.23-performance-architecture-sweep',
+    scheduler:()=>window.WW9PerfScheduler&&window.WW9PerfScheduler.snapshot?window.WW9PerfScheduler.snapshot():null,
+    dom:domStats,
+    longTasks:()=>longTasks.slice(),
+    note:'Event-driven housekeeping, dirty-only autosave safety, rAF hover work, 60fps dual-view cap, stopped hidden 3D loop, single-world MapLibre rendering.'
+  };
 })();
 </script>
-
-
-<script id="ww9VectorCloseBuildingsV1">
-(function(){
-'use strict';
-if(window.__ww9VectorCloseBuildingsV1)return;
-window.__ww9VectorCloseBuildingsV1=true;
-
-const SOURCE='ww9-city-places-v31';
-const SOURCE_URL='https://tiles.openfreemap.org/planet';
-const SOURCE_ATTR='OpenFreeMap © OpenMapTiles Data from OpenStreetMap';
-const BUILDING_SOURCE_LAYER='building';
-const FILL_ID='ww9-close-building-v1-fill';
-const OUTLINE_ID='ww9-close-building-v1-outline';
-const ALL_IDS=[FILL_ID,OUTLINE_ID];
-const MIN_ZOOM=13.9;
-let lastError=null,lastInstall=0,lastData=0;
-
-function adapter(){return window.WW9Map||window.map||null}
-function gl(){const a=adapter();return a&&a._maplibre||null}
-function roadsOn(){const t=document.getElementById('roadsToggle');return !t||!!t.checked}
-function isSat(){const t=document.getElementById('satelliteToggle');return !!(t&&t.checked)}
-function isLight(){const t=document.getElementById('themeToggle');return !!(t&&t.checked)&&!isSat()}
-function setVisible(on){
-  const m=gl();if(!m)return false;on=typeof on==='boolean'?on:roadsOn();
-  ALL_IDS.forEach(id=>{try{if(m.getLayer(id))m.setLayoutProperty(id,'visibility',on?'visible':'none')}catch(e){}});
-  return true;
-}
-function applyTheme(){
-  const m=gl();if(!m)return;
-  const sat=isSat(),light=isLight();
-  const fill=light?'rgba(116,137,176,0.34)':(sat?'rgba(138,166,214,0.18)':'rgba(72,97,145,0.54)');
-  const outline=light?'rgba(156,177,212,0.46)':(sat?'rgba(205,219,247,0.24)':'rgba(123,151,212,0.42)');
-  if(m.getLayer(FILL_ID))try{m.setPaintProperty(FILL_ID,'fill-color',fill)}catch(e){}
-  if(m.getLayer(OUTLINE_ID))try{m.setPaintProperty(OUTLINE_ID,'line-color',outline)}catch(e){}
-  if(m.getLayer(OUTLINE_ID))try{m.setPaintProperty(OUTLINE_ID,'line-opacity',light?0.72:(sat?0.42:0.62))}catch(e){}
-}
-function addLayers(m){
-  if(!m.getLayer(FILL_ID))m.addLayer({
-    id:FILL_ID,
-    type:'fill',
-    source:SOURCE,
-    'source-layer':BUILDING_SOURCE_LAYER,
-    minzoom:MIN_ZOOM,
-    maxzoom:24,
-    layout:{'visibility':roadsOn()?'visible':'none'},
-    paint:{
-      'fill-color':'rgba(72,97,145,0.54)',
-      'fill-opacity':1,
-      'fill-antialias':true,
-      'fill-outline-color':'rgba(123,151,212,0.18)'
-    }
-  });
-  if(!m.getLayer(OUTLINE_ID))m.addLayer({
-    id:OUTLINE_ID,
-    type:'line',
-    source:SOURCE,
-    'source-layer':BUILDING_SOURCE_LAYER,
-    minzoom:MIN_ZOOM,
-    maxzoom:24,
-    layout:{'visibility':roadsOn()?'visible':'none','line-join':'round','line-cap':'round'},
-    paint:{
-      'line-color':'rgba(123,151,212,0.42)',
-      'line-opacity':0.62,
-      'line-width':['interpolate',['linear'],['zoom'],MIN_ZOOM,0.45,18,0.7,24,1.05]
-    }
-  });
-}
-function registerOrder(){
-  const a=adapter();if(!a||!a._registerNativeLayer)return;
-  try{a._registerNativeLayer(FILL_ID,311.65)}catch(e){}
-  try{a._registerNativeLayer(OUTLINE_ID,311.66)}catch(e){}
-  try{a._syncLayerOrder&&a._syncLayerOrder()}catch(e){}
-}
-function install(){
-  const m=gl();if(!m||!m.isStyleLoaded||!m.isStyleLoaded())return false;
-  try{
-    if(!m.getSource(SOURCE))m.addSource(SOURCE,{type:'vector',url:SOURCE_URL,attribution:SOURCE_ATTR});
-    addLayers(m);registerOrder();applyTheme();setVisible(roadsOn());
-    lastInstall=Date.now();lastError=null;return true;
-  }catch(e){lastError=String(e&&e.message||e);console.warn('WW9 close-range buildings install failed',e);return false}
-}
-function sync(){if(!install())return false;registerOrder();applyTheme();setVisible(roadsOn());return true}
-function boot(){
-  let tries=0,t=setInterval(()=>{tries++;if(sync()||tries>180)clearInterval(t)},100);
-  ['roadsToggle','themeToggle','satelliteToggle'].forEach(id=>{const el=document.getElementById(id);if(!el||el.__ww9CloseBuildingsV1)return;el.__ww9CloseBuildingsV1=true;el.addEventListener('change',()=>setTimeout(sync,0))});
-  let n=0,mt=setInterval(()=>{n++;const m=gl();if(m){clearInterval(mt);try{
-    m.on('styledata',()=>setTimeout(sync,45));
-    m.on('sourcedata',e=>{if(e&&e.sourceId===SOURCE&&e.isSourceLoaded)lastData=Date.now()});
-    m.on('error',e=>{try{if(e&&e.sourceId===SOURCE)lastError=String(e.error&&e.error.message||e.error||'vector building source error')}catch(_e){}});
-  }catch(e){}}else if(n>180)clearInterval(mt)},100);
-}
-if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',boot,{once:true});else boot();
-window.WW9CloseBuildingsV1={
-  sync,setVisible,
-  diagnostics:()=>({source:SOURCE_URL,sourceLayer:BUILDING_SOURCE_LAYER,minZoom:MIN_ZOOM,visible:roadsOn(),installed:!!(gl()&&gl().getLayer(FILL_ID)&&gl().getLayer(OUTLINE_ID)),lastInstallIso:lastInstall?new Date(lastInstall).toISOString():null,lastDataIso:lastData?new Date(lastData).toISOString():null,lastError})
-};
-})();
-</script>
-
 </body></html>
 <style id="ww9V11732TropicalBrandingPatch">
 #ww9TropicalPanel .ww9-t2-title:empty{display:none!important}
@@ -59071,7 +58993,7 @@ body.ww9-custom-ui.ww9-theme-pride #ww9TropicalPanel .ww9-t2-storm.active,body.w
   "use strict";
   window.__ww9WorldMirrorInstalled=true;
   const map=window.WW9Map||window.map;
-  try{const gl=map&&(map._maplibre||map._gl);if(gl&&gl.setRenderWorldCopies)gl.setRenderWorldCopies(true);}catch(e){}
+  try{const gl=map&&(map._maplibre||map._gl);if(gl&&gl.setRenderWorldCopies)gl.setRenderWorldCopies(window.WW9_LOW_POWER?false:true);}catch(e){}
   window.WW9WorldMirrors={refresh:function(){},clear:function(){},get count(){return 0;},engine:"maplibre-native-world-copies"};
 })();
 </script>
@@ -59091,12 +59013,12 @@ function sourceTiles(map,id){try{const s=map.getStyle().sources[id];return s&&Ar
 function syncSatellite(){const map=m();if(!map||!map.isStyleLoaded||!map.isStyleLoaded())return false;const on=!!document.getElementById('satelliteToggle')?.checked,light=!!document.getElementById('themeToggle')?.checked;try{
   if(!map.getSource(SAT_SRC))map.addSource(SAT_SRC,{type:'raster',tiles:['https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}','https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'],tileSize:256,minzoom:0,maxzoom:23});
   if(!map.getLayer(SAT_LAYER)){const firstOverlay=(map.getStyle().layers||[]).find(l=>/roadsPane|boundary|county|state|label/i.test(String(l.id||'')));map.addLayer({id:SAT_LAYER,type:'raster',source:SAT_SRC,minzoom:0,maxzoom:24,paint:{'raster-opacity':1,'raster-resampling':'linear','raster-fade-duration':0}},firstOverlay&&firstOverlay.id)}
-  map.setLayoutProperty(SAT_LAYER,'visibility',on?'visible':'none');
+  const want=on?'visible':'none';if(map.getLayoutProperty(SAT_LAYER,'visibility')!==want)map.setLayoutProperty(SAT_LAYER,'visibility',want);
   // Old compatibility basemaps can otherwise sit above the native satellite.
   for(const l of map.getStyle().layers||[]){if(!l.source||l.id===SAT_LAYER)continue;const urls=sourceTiles(map,l.source).join(' ');if(/World_(?:Dark|Light)_Gray_Base/i.test(urls))map.setLayoutProperty(l.id,'visibility',on?'none':(/Light_Gray/i.test(urls)?(light?'visible':'none'):(!light?'visible':'none')));if(/World_Imagery/i.test(urls)&&l.id!==SAT_LAYER)map.setLayoutProperty(l.id,'visibility','none')}
-  map.triggerRepaint&&map.triggerRepaint();return true;
+  return true;
 }catch(e){console.warn('WW9 Phase15 satellite sync failed',e);return false}}
-function boot(){let n=0,t=setInterval(()=>{n++;const map=m();if(map&&map.isStyleLoaded&&map.isStyleLoaded()){clearInterval(t);syncSatellite();document.getElementById('satelliteToggle')?.addEventListener('change',()=>setTimeout(syncSatellite,0));document.getElementById('themeToggle')?.addEventListener('change',()=>setTimeout(syncSatellite,0));map.on('styledata',()=>setTimeout(syncSatellite,80));}else if(n>180)clearInterval(t)},100)}
+function boot(){window.WW9PerfScheduler.retry('satellite-map-ready',100,181,function(){const map=m();if(map&&map.isStyleLoaded&&map.isStyleLoaded()){syncSatellite();document.getElementById('satelliteToggle')?.addEventListener('change',()=>setTimeout(syncSatellite,0));document.getElementById('themeToggle')?.addEventListener('change',()=>setTimeout(syncSatellite,0));map.on('style.load',()=>setTimeout(syncSatellite,120));return true}return false})}
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',boot,{once:true});else boot();
 window.WW9Phase15Diagnostics={get satellite(){const map=m();return{enabled:!!document.getElementById('satelliteToggle')?.checked,source:!!map?.getSource(SAT_SRC),layer:!!map?.getLayer(SAT_LAYER),visibility:map?.getLayer(SAT_LAYER)?map.getLayoutProperty(SAT_LAYER,'visibility'):null}},get rtma(){try{return window.WW9RtmaAnalysisEngine?.diagnostics?window.WW9RtmaAnalysisEngine.diagnostics():{grid:window.WW9RtmaAnalysisEngine?.grid,source:window.WW9RtmaAnalysisEngine?.source}}catch(e){return{error:String(e)}}},get radar3d(){try{return window.WW93dRadarVolume?.state?Object.assign(window.WW93dRadarVolume.state(),{physicalRenderer:'separate transparent Three.js compositor above MapLibre'}):null}catch(e){return{error:String(e)}}},get crossSection(){try{return window.WW9RadarCrossSection?.state?Object.assign(window.WW9RadarCrossSection.state(),{renderer:'v1.17 direct-pixel / linear inter-tilt interpolation'}):null}catch(e){return{error:String(e)}}}};
 })();
